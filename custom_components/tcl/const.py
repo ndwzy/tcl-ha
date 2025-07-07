@@ -6,7 +6,8 @@ SUPPORTED_PLATFORMS = [
     Platform.SELECT,
     Platform.NUMBER,
     Platform.SENSOR,
-    Platform.SWITCH
+    Platform.SWITCH,
+    Platform.CLIMATE # 添加这一行
 ]
 
 FILTER_TYPE_INCLUDE = 'include'
