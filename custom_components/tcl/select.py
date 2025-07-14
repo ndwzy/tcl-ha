@@ -9,6 +9,7 @@ from . import async_register_entity
 from .core.attribute import TclAttribute
 from .core.device import TclDevice
 from .entity import TclAbstractEntity
+from .helpers import get_key_by_value
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,9 +37,13 @@ class TclSelect(TclAbstractEntity, SelectEntity):
             self._attr_current_option = self._get_value_from_comparison_table(self._attributes_data[self._attribute.key])
 
     def select_option(self, option: str) -> None:
-        self._send_command({
-            self._attribute.key: option
-        })
+        _LOGGER.debug('shady '+self._attribute.key+' '+option)
+        #这里需要通过option反查key
+        key = get_key_by_value(self._attribute.ext.get('value_comparison_table'),option)
+        if key:
+            self._send_command({
+                self._attribute.key: key
+            })
 
     def _get_value_from_comparison_table(self, value):
         value_comparison_table = self._attribute.ext.get('value_comparison_table', {})

@@ -89,7 +89,7 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
         """从设备属性数据中更新实体状态。"""
         # 检查电源开关状态
         # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-        power = self._attributes_data.get("powerSwitch")
+        power = self._device.attribute_snapshot_data.get("powerSwitch")
         if power is None:
             # 如果 powerSwitch 不存在，可能设备离线或数据未完全加载
             self._attr_available = False
@@ -102,7 +102,7 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
         if power in ["off", False, 0]:
             self._attr_hvac_mode = HVACMode.OFF
         else:
-            mode = self._attributes_data.get("workMode")
+            mode = self._device.attribute_snapshot_data.get("workMode")
             self._attr_hvac_mode = MODE_MAP.get(mode, HVACMode.AUTO)
 
         # 设置 HVAC 动作
@@ -121,11 +121,11 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
 
         # 设置目标温度
         # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-        self._attr_target_temperature = self._attributes_data.get("targetTemperature") or 24 # 默认温度为24
+        self._attr_target_temperature = self._device.attribute_snapshot_data.get("targetTemperature") or 24 # 默认温度为24
 
         # 设置风扇模式
         # 从设备获取实际风速百分比
-        wind_speed_percentage = self._attributes_data.get("windSpeedPercentage")
+        wind_speed_percentage = self._device.attribute_snapshot_data.get("windSpeedPercentage")
         # 查找最接近的自定义模式名称
         if wind_speed_percentage is not None:
             # 找到最接近的预设风速
@@ -134,33 +134,33 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
         else:
             self._attr_fan_mode = "中" # 如果数据缺失，默认"中"
 
-    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+    def set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """设置 HVAC 模式。"""
         if hvac_mode == HVACMode.OFF:
             # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-            await self._send_command({"powerSwitch": False})
+            self._send_command({"powerSwitch": False})
         else:
             # 如果当前是关闭状态，先打开电源
             # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-            if self._attributes_data.get("powerSwitch") in ["off", False, 0]:
-                await self._send_command({"powerSwitch": True})
-                await asyncio.sleep(0.5) # 稍微延迟，确保电源状态已更新
+            if self._device.attribute_snapshot_data.get("powerSwitch") in ["off", False, 0]:
+                self._send_command({"powerSwitch": True})
+                asyncio.sleep(0.5) # 稍微延迟，确保电源状态已更新
             # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-            await self._send_command({"workMode": REVERSE_MODE_MAP.get(hvac_mode, "auto")})
+            self._send_command({"workMode": REVERSE_MODE_MAP.get(hvac_mode, "auto")})
 
-    async def async_set_fan_mode(self, fan_mode: str) -> None:
+    def set_fan_mode(self, fan_mode: str) -> None:
         """设置风扇模式。"""
         # 将自定义模式名称转换为对应的风速百分比
         target_speed = FAN_SPEED_MAP.get(fan_mode)
         if target_speed is not None:
             # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-            await self._send_command({"windSpeedPercentage": target_speed})
+            self._send_command({"windSpeedPercentage": target_speed})
         else:
             _LOGGER.warning(f"无法识别的风扇模式: {fan_mode}")
 
-    async def async_set_temperature(self, **kwargs: Any) -> None:
+    def set_temperature(self, **kwargs: Any) -> None:
         """设置目标温度。"""
         temp = kwargs.get(ATTR_TEMPERATURE)
         if temp:
             # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-            await self._send_command({"targetTemperature": temp})
+            self._send_command({"targetTemperature": temp})
