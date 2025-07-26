@@ -143,7 +143,7 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
         else:
             self._attr_fan_mode = "中"  # 如果数据缺失，默认"中"
 
-    def set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """设置 HVAC 模式。"""
         if hvac_mode == HVACMode.OFF:
             # 注意：这里将属性键改为驼峰命名法以匹配设备数据
@@ -153,12 +153,12 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
             # 注意：这里将属性键改为驼峰命名法以匹配设备数据
             if self._device.attribute_snapshot_data.get("powerSwitch") in ["off", False, 0]:
                 self._send_command({"powerSwitch": 1})
-                asyncio.sleep(0.5)  # 稍微延迟，确保电源状态已更新
+                await asyncio.sleep(0.5)  # 稍微延迟，确保电源状态已更新
             # 注意：这里将属性键改为驼峰命名法以匹配设备数据
             modeKey=REVERSE_MODE_MAP.get(hvac_mode, "auto")
             self._send_command({"workMode": STR_TO_CODE.get(modeKey, "auto")})
 
-        def set_fan_mode(self, fan_mode: str) -> None:
+    def set_fan_mode(self, fan_mode: str) -> None:
             """设置风扇模式。"""
             # 将自定义模式名称转换为对应的风速百分比
             target_speed = FAN_SPEED_MAP.get(fan_mode)

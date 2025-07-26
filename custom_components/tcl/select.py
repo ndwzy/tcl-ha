@@ -37,7 +37,6 @@ class TclSelect(TclAbstractEntity, SelectEntity):
             self._attr_current_option = self._get_value_from_comparison_table(self._attributes_data[self._attribute.key])
 
     def select_option(self, option: str) -> None:
-        _LOGGER.debug('shady '+self._attribute.key+' '+option)
         #这里需要通过option反查key
         key = get_key_by_value(self._attribute.ext.get('value_comparison_table'),option)
         if key:
