@@ -136,9 +136,9 @@ async def async_remove_config_entry_device(hass: HomeAssistant, config: ConfigEn
 
     _LOGGER.info('Device [{}] removing...'.format(device_id))
 
-    for device in hass.data[DOMAIN]['devices']:
-        if device.id.lower() == device_id:
-            target_device = device
+    for dev in hass.data[DOMAIN]['devices']:
+        if dev.id.lower() == device_id:
+            target_device = dev
             break
     else:
         _LOGGER.error('Device [{}] not found'.format(device_id))

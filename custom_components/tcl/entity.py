@@ -18,7 +18,7 @@ _LOGGER = logging.getLogger(__name__)
 class TclAbstractEntity(Entity, ABC):
     _device: TclDevice
     _client: TclClient
-    _attribute: TclDevice
+    _attribute: TclAttribute
 
     def __init__(self, device: TclDevice, attribute: TclAttribute):
         self._attr_unique_id = '{}.{}_{}'.format(DOMAIN, device.id, attribute.key).lower()
@@ -89,9 +89,9 @@ class TclAbstractEntity(Entity, ABC):
         # 监听事件总线来的控制命令
         async def control_callback(e):
             #每个实体都会注册该事件，目前根据entityId进行判断防治多次操作
-            if(self.entity_id==e.data['entityId']):
+            if self.entity_id == e.data['entityId']:
                 # _LOGGER.warning('_send_command' + str(e.data['attributes']) + '_attr_name' + self._attr_name + 'entity_id' + self.entity_id)
-                await self._client.send_command(self._client.getSession,self._client.getToken,e.data['deviceId'], e.data['attributes'])
+                await self._client.send_command(self._client.getSession, self._client.getToken, e.data['deviceId'], e.data['attributes'])
                 # 直接刷新属性状状
                 device_data = self._device.attribute_snapshot_data
                 for key, value in e.data['attributes'].items():

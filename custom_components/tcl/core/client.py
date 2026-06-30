@@ -33,7 +33,7 @@ REFRESH_TOKEN_API = 'https://cn.account.tcl.com/auth/auth/refershToken'
 GET_USER_INFO_API = 'https://cn.account.tcl.com/user/user/getUserInfoByToken'
 GET_DEVICES_API = 'https://io.zx.tcljd.com/v1/tclplus/weChat/user/user_devices'
 GET_MQTT_CONFIG_API = 'https://io.zx.tcljd.com/v1/auth/service/loadBalance'
-CONTROIL_DEVICE_API = 'https://io.zx.tcljd.com/v1/control/property/{deviceId}'
+CONTROL_DEVICE_API = 'https://io.zx.tcljd.com/v1/control/property/{deviceId}'
 DEVICE_STATUS_API = 'https://io.zx.tcljd.com/v1/thing/status'
 GET_DIGITAL_MODEL_API = 'https://io.zx.tcljd.com/v1/tclplus/panel/rn-panel-config'
 
@@ -88,9 +88,7 @@ class TclClient:
         self.ssl_context = await self._create_ssl_context()
 
     async def _create_ssl_context(self):
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS)
-        context.verify_mode = ssl.CERT_REQUIRED
-        await self.hass.async_add_executor_job(context.load_default_certs)
+        context = await self.hass.async_add_executor_job(ssl.create_default_context)
         return context
 
     async def refresh_token(self, refresh_token: str) -> TokenInfo:
@@ -153,22 +151,26 @@ class TclClient:
                 'username': userinfo['username']
             }
 
-    async def get_mqtt_config(self) -> List[TclDevice]:
-        """
-        获取设备列表
-        """
-        api_headers = {
+    def _get_io_headers(self, content_type: str = "application/x-www-form-urlencoded;charset=utf-8") -> dict:
+        """获取 io.zx.tcljd.com 通用的请求头"""
+        return {
             "Host": "io.zx.tcljd.com",
             "accessToken": self._token,
             "t-app-version": APP_VERSION,
             "t-store-uuid": APP_UUID,
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13)XWEB/13639",
-            "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+            "Content-Type": content_type,
             "xweb_xhr": "1",
             "miniGramSetup": "1",
             "t-platform-type": APP_PLATFORM_TYPE,
             "Referer": "https://servicewechat.com/wxed3f11c6ee178737/243/page-frame.html"
         }
+
+    async def get_mqtt_config(self) -> List[TclDevice]:
+        """
+        获取MQTT配置
+        """
+        api_headers = self._get_io_headers()
         async with self._session.get(url=GET_MQTT_CONFIG_API, headers=api_headers) as response:
             content = await response.json(content_type=None)
             self._assert_response_successful(content)
@@ -178,18 +180,7 @@ class TclClient:
         """
         获取设备列表
         """
-        api_headers = {
-            "Host": "io.zx.tcljd.com",
-            "accessToken": self._token,
-            "t-app-version": APP_VERSION,
-            "t-store-uuid": APP_UUID,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13)XWEB/13639",
-            "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
-            "xweb_xhr": "1",
-            "miniGramSetup": "1",
-            "t-platform-type": APP_PLATFORM_TYPE,
-            "Referer": "https://servicewechat.com/wxed3f11c6ee178737/243/page-frame.html"
-        }
+        api_headers = self._get_io_headers()
         async with self._session.get(url=GET_DEVICES_API, headers=api_headers) as response:
             content = await response.json(content_type=None)
             self._assert_response_successful(content)
@@ -213,28 +204,16 @@ class TclClient:
         """
         api_url = GET_DIGITAL_MODEL_API + '?productKey=' + productKey
 
-        api_headers = {
-            "Host": "io.zx.tcljd.com",
-            "accessToken": self._token,
-            "t-app-version": APP_VERSION,
-            "t-store-uuid": APP_UUID,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13)XWEB/13639",
-            "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
-            "xweb_xhr": "1",
-            "miniGramSetup": "1",
-            "t-platform-type": APP_PLATFORM_TYPE,
-            "Referer": "https://servicewechat.com/wxed3f11c6ee178737/243/page-frame.html"
-        }
+        api_headers = self._get_io_headers()
         async with self._session.get(url=api_url, headers=api_headers) as response:
             content = await response.json(content_type=None)
             self._assert_response_successful(content)
-            if 'pages' not in content['data']:
-                if 'home' not in content['data']['pages']:
-                    _LOGGER.warning("Device {} get digital model fail. response: {}".format(
-                        productKey,
-                        json.dumps(content, ensure_ascii=False)
-                    ))
-                    return []
+            if 'pages' not in content['data'] or 'home' not in content['data']['pages']:
+                _LOGGER.warning("Device {} get digital model fail. response: {}".format(
+                    productKey,
+                    json.dumps(content, ensure_ascii=False)
+                ))
+                return []
 
             return content['data']['pages']['home']
 
@@ -280,18 +259,7 @@ class TclClient:
         :param deviceId:
         :return:
         """
-        api_headers = {
-            "Host": "io.zx.tcljd.com",
-            "accessToken": self._token,
-            "t-app-version": APP_VERSION,
-            "t-store-uuid": APP_UUID,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13)XWEB/13639",
-            "Content-Type": "application/json;charset=UTF-8",
-            "xweb_xhr": "1",
-            "miniGramSetup": "1",
-            "t-platform-type": APP_PLATFORM_TYPE,
-            "Referer": "https://servicewechat.com/wxed3f11c6ee178737/243/page-frame.html"
-        }
+        api_headers = self._get_io_headers("application/json;charset=UTF-8")
 
         api_body = {"deviceId": deviceId}
         async with self._session.post(url=DEVICE_STATUS_API, headers=api_headers, json=api_body) as response:
@@ -453,7 +421,7 @@ class TclClient:
 
     @staticmethod
     async def send_command(session, token, deviceId: str, attributes: dict):
-        api_url = CONTROIL_DEVICE_API.format(deviceId=deviceId)
+        api_url = CONTROL_DEVICE_API.format(deviceId=deviceId)
         api_headers = {
             "Host": "io.zx.tcljd.com",
             "accessToken": token,

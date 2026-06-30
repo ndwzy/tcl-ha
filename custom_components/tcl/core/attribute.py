@@ -12,12 +12,12 @@ _LOGGER = logging.getLogger(__name__)
 
 class TclAttribute:
 
-    def __init__(self, key: str, display_name: str, platform: Platform, options: dict = {}, ext: dict = {}):
+    def __init__(self, key: str, display_name: str, platform: Platform, options: dict = None, ext: dict = None):
         self._key = key
         self._display_name = display_name
         self._platform = platform
-        self._options = options
-        self._ext = ext
+        self._options = options if options is not None else {}
+        self._ext = ext if ext is not None else {}
 
     @property
     def key(self) -> str:

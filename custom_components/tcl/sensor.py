@@ -107,8 +107,6 @@ class TclSensor(TclAbstractEntity, SensorEntity):
             }
         except Exception as e:
             # 捕获整个方法中的任何异常
-            import logging
-            _LOGGER = logging.getLogger(__name__)
             _LOGGER.error(f"Error updating sensor value: {e}")
             self._attr_native_value = f"Error: {str(e)}"
             self._attr_extra_state_attributes = {

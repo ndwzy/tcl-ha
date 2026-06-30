@@ -146,7 +146,7 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
         # 注意：这里将属性键改为驼峰命名法以匹配设备数据
         self._attr_target_temperature = self._device.attribute_snapshot_data.get("targetTemperature") or 24  # 默认温度为24
         # 更新当前温度
-        self._current_temperature = self._device.attribute_snapshot_data.get("currentTemperature") or None
+        self._attr_current_temperature = self._device.attribute_snapshot_data.get("currentTemperature") or None
         # 设置风扇模式
         # 从设备获取实际风速百分比
         wind_speed_percentage = self._device.attribute_snapshot_data.get("windSpeedPercentage")
@@ -209,28 +209,29 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
         # 设置为 OFF
         await self.async_set_hvac_mode(HVACMode.OFF)
 
-    def set_fan_mode(self, fan_mode: str) -> None:
-            """设置风扇模式。"""
-            # 将自定义模式名称转换为对应的风速百分比
-            target_speed = FAN_SPEED_MAP.get(fan_mode)
-            if target_speed is not None:
-                # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-                self._send_command({"windSpeedPercentage": target_speed})
-            else:
-                _LOGGER.warning(f"无法识别的风扇模式: {fan_mode}")
+    async def async_set_fan_mode(self, fan_mode: str) -> None:
+        """设置风扇模式。"""
+        # 将自定义模式名称转换为对应的风速百分比
+        target_speed = FAN_SPEED_MAP.get(fan_mode)
+        if target_speed is not None:
+            # 注意：这里将属性键改为驼峰命名法以匹配设备数据
+            self._send_command({"windSpeedPercentage": target_speed})
+        else:
+            _LOGGER.warning(f"无法识别的风扇模式: {fan_mode}")
 
-    def set_temperature(self, **kwargs: Any) -> None:
+    async def async_set_temperature(self, **kwargs: Any) -> None:
         """设置目标温度。"""
         temp = kwargs.get(ATTR_TEMPERATURE)
-        if temp:
+        if temp is not None:
             # 注意：这里将属性键改为驼峰命名法以匹配设备数据
             self._send_command({"targetTemperature": temp})
+
     @property
     def swing_modes(self):
         """摆动列表"""
-        return [SWING_OFF,SWING_BOTH,SWING_VERTICAL,SWING_HORIZONTAL]
+        return [SWING_OFF, SWING_BOTH, SWING_VERTICAL, SWING_HORIZONTAL]
 
-    def set_swing_mode(self, swing_mode: str) -> None:
+    async def async_set_swing_mode(self, swing_mode: str) -> None:
         """设置摆动"""
         if swing_mode == SWING_OFF:
             self._send_command({"verticalWind": 0, "horizontalWind": 0})
