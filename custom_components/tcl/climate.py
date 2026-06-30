@@ -86,6 +86,9 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
             ClimateEntityFeature.TARGET_TEMPERATURE
             | ClimateEntityFeature.FAN_MODE
             | ClimateEntityFeature.SWING_MODE
+            # 新增下面两行，开启 UI 的开关按钮
+            | ClimateEntityFeature.TURN_ON
+            | ClimateEntityFeature.TURN_OFF
         # 移除 ClimateEntityFeature.HVAC_MODE，因为您的 HomeAssistant 版本可能不支持此属性
     )
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
@@ -99,6 +102,8 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
         super().__init__(device, attribute)
 
         # TclAbstractEntity 会从 dummy attribute 设置 _attr_name 和 _attr_unique_id，这里无需再次设置
+        # 初始化记忆模式，默认给个自动，防止第一次无数据
+        self._last_on_mode = HVACMode.AUTO
 
     def _update_value(self) -> None:
         """从设备属性数据中更新实体状态。"""
@@ -120,6 +125,8 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
             mode = self._device.attribute_snapshot_data.get("workMode")
             mode_key=REVERSE_STR_TO_CODE.get(mode,0)
             self._attr_hvac_mode = MODE_MAP.get(mode_key, HVACMode.AUTO)
+            # 只要不是关机，就实时记录当前模式到记忆变量
+            self._last_on_mode = self._attr_hvac_mode
 
         # 设置 HVAC 动作
         if self._attr_hvac_mode == HVACMode.HEAT:
@@ -175,6 +182,32 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
             # 注意：这里将属性键改为驼峰命名法以匹配设备数据
             modeKey=REVERSE_MODE_MAP.get(hvac_mode, "auto")
             self._send_command({"workMode": STR_TO_CODE.get(modeKey, "auto")})
+
+    # Implement one of these methods.
+    # The `turn_on` method should set `hvac_mode` to any other than
+    # `HVACMode.OFF` by optimistically setting it from the service action
+    # handler or with the next state update
+
+    async def async_turn_on(self):
+        """Turn the entity on."""
+        # 获取记忆模式
+        target_mode = self._last_on_mode
+
+        # 安全防御：如果记忆模式是 OFF (极少见)，则强制转为自动或制热
+        if target_mode == HVACMode.OFF:
+            target_mode = HVACMode.AUTO
+
+        # 调用自身的设置模式方法 (注意要加 await 和 self)
+        await self.async_set_hvac_mode(target_mode)
+
+    async def async_turn_off(self):
+        """Turn the entity off."""
+        # 关机前最后保存一次当前模式 (双重保险)
+        if self._attr_hvac_mode != HVACMode.OFF:
+            self._last_on_mode = self._attr_hvac_mode
+
+        # 设置为 OFF
+        await self.async_set_hvac_mode(HVACMode.OFF)
 
     def set_fan_mode(self, fan_mode: str) -> None:
             """设置风扇模式。"""
