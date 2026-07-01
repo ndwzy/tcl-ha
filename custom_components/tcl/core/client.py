@@ -349,7 +349,7 @@ class TclClient:
                     parts = msg.topic.split('/')
                     if len(parts) >= 4:
                         device_id = parts[3]
-                        _LOGGER.warning(f"设备 {device_id} 属性更新: {payload}")
+                        # _LOGGER.debug(f"设备 {device_id} 属性更新: {payload}")
 
                         # 提取属性值
                         if "params" in payload:
