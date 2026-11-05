@@ -18,6 +18,11 @@ from .const import (
     MIN_SCAN_INTERVAL,
     POLL_JITTER_MAX,
     POLL_WAIT_CHUNK,
+    TOKEN_REFRESH_MARGIN_RATIO,
+    TOKEN_REFRESH_MARGIN_MIN,
+    TOKEN_REFRESH_MARGIN_MAX,
+    TOKEN_RETRY_MIN,
+    TOKEN_RETRY_MAX,
 )
 from .core.attribute import TclAttribute
 from .core.client import TclClient, EVENT_DEVICE_DATA_CHANGED, TclClientException, TokenInfo
@@ -199,13 +204,29 @@ async def data_updater(hass: HomeAssistant, entry: ConfigEntry, targetDevices: L
         next_due = _next_due(time.monotonic())
 
 
+def _refresh_margin(remaining: float) -> float:
+    """
+    续期余量：按剩余有效期的比例计算，并夹在 [1 小时, 24 小时]。
+
+    30 天有效期的 token 会提前 24 小时续期。余量放大不会增加刷新频率
+    (仍然是约 29 天一次)，但刷新失败时能多出几十次重试机会。
+    """
+    return min(
+        max(remaining * TOKEN_REFRESH_MARGIN_RATIO, TOKEN_REFRESH_MARGIN_MIN),
+        TOKEN_REFRESH_MARGIN_MAX,
+    )
+
+
 def _token_check_delay(hass: HomeAssistant, entry: ConfigEntry) -> float:
     """
     距离下次检查 token 还要等多久(秒)。
 
-    expires_at 来自刷新接口返回的 JWT 载荷(exp)，能精确到秒，提前 5 分钟续期。
+    expires_at 来自刷新接口返回的 JWT 载荷(exp)，能精确到秒，按需提前续期。
     登录流程拿到的是小程序渠道的老格式串，解析不出有效期，此时 expires_at=0，
     退化为每 30 分钟做一次轻量校验，等第一次刷新后就会自动补上真实有效期。
+
+    已过期的 token 不再返回 0，否则 token_updater 会退化成每秒重试一次，
+    连续失败时等于每秒打两次接口并把日志刷满。
     """
     try:
         expires_at = AccountConfig(hass, entry).expires_at or 0
@@ -215,14 +236,30 @@ def _token_check_delay(hass: HomeAssistant, entry: ConfigEntry) -> float:
     if expires_at > 10 ** 11:  # 毫秒时间戳
         expires_at = expires_at / 1000
 
-    if expires_at:
-        remaining = expires_at - time.time()
-        if remaining <= 0:
-            return 0
-        # 提前续期，避免正好卡在过期的那一刻
-        return max(remaining - 300, 30)
+    if not expires_at:
+        return 1800
 
-    return 1800
+    remaining = expires_at - time.time()
+    if remaining <= 0:
+        # 已经过期还停在循环里，说明之前的刷新都失败了，退到分钟级重试
+        return TOKEN_RETRY_MIN
+
+    return max(remaining - _refresh_margin(remaining), TOKEN_RETRY_MIN)
+
+
+def _fmt_duration(seconds: float) -> str:
+    """把秒数格式化成便于阅读的时长，用于日志。"""
+    total = int(seconds)
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    if days:
+        return '{}天{}小时'.format(days, hours)
+    if hours:
+        return '{}小时{}分'.format(hours, mins)
+    if mins:
+        return '{}分{}秒'.format(mins, secs)
+    return '{}秒'.format(secs)
 
 
 async def token_updater(hass: HomeAssistant, entry: ConfigEntry, signal: threading.Event):
@@ -231,19 +268,29 @@ async def token_updater(hass: HomeAssistant, entry: ConfigEntry, signal: threadi
 
     这里必须兜住所有异常——后台任务一旦抛出未捕获异常就会永久退出，
     之后 token 再也没人续期，只能等用户手动重载集成。
+    刷新失败走 60s→1800s 的指数退避，成功一次即重置，避免接口被打爆。
     """
+    delay = _token_check_delay(hass, entry)
+    retry_delay = TOKEN_RETRY_MIN
+    _LOGGER.info('token 续期已排期：%s 后检查', _fmt_duration(delay))
+
     while not signal.is_set():
-        if await _interruptible_sleep(signal, _token_check_delay(hass, entry)):
+        if await _interruptible_sleep(signal, delay):
             break
 
         try:
             refreshed = await try_update_token(hass, entry)
         except Exception as err:  # noqa: BLE001 任何异常都不能让任务退出
-            _LOGGER.warning('检查 token 失败，稍后重试: %s', err)
+            _LOGGER.warning('检查 token 失败，%ss 后重试: %s', retry_delay, err)
+            delay = retry_delay
+            retry_delay = min(retry_delay * 2, TOKEN_RETRY_MAX)
             continue
 
+        retry_delay = TOKEN_RETRY_MIN
+
         if not refreshed:
-            _LOGGER.debug('token is valid')
+            delay = _token_check_delay(hass, entry)
+            _LOGGER.info('token 仍有效，下次检查：%s 后', _fmt_duration(delay))
             continue
 
         _LOGGER.info('token refreshed, reload integration...')

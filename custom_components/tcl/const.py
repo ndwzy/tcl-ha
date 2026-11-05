@@ -39,6 +39,17 @@ MQTT_DISCONNECT_GRACE = 60
 # 连接仍在但长时间收不到任何消息时的看门狗阈值(秒)
 MQTT_SILENT_TIMEOUT = 1800
 
+# ---------------- token 续期参数 ----------------
+# 续期余量按"剩余有效期"的比例计算，并夹在 [1 小时, 24 小时] 之间：
+# 30 天有效期的 token 会在到期前 24 小时续期，即使刷新连续失败也有充足的重试窗口。
+# 余量放大不影响刷新次数（仍然是约 29 天一次），但失败时不再只剩 5 分钟可用。
+TOKEN_REFRESH_MARGIN_RATIO = 0.05
+TOKEN_REFRESH_MARGIN_MIN = 3600
+TOKEN_REFRESH_MARGIN_MAX = 24 * 3600
+# 刷新失败后的重试退避(秒)，避免 token 已经过期时秒级重试把接口打爆
+TOKEN_RETRY_MIN = 60
+TOKEN_RETRY_MAX = 1800
+
 # 登录方式
 LOGIN_METHOD_TOKEN = 'token'
 LOGIN_METHOD_PASSWORD = 'password'
