@@ -224,12 +224,14 @@ class TclConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> config_entries.OptionsFlow:
-        return OptionsFlowHandler(config_entry)
+        # HA 2024.11 起 OptionsFlow.config_entry 由框架注入且只读，
+        # 不能再自己 __init__(config_entry) 赋值，否则打开"配置"会抛
+        # AttributeError: property 'config_entry' has no setter
+        return OptionsFlowHandler()
 
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self.config_entry = config_entry
+    def __init__(self) -> None:
         self._sms_phone = None
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
