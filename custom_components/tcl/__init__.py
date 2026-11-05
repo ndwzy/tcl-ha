@@ -262,6 +262,21 @@ def _fmt_duration(seconds: float) -> str:
     return '{}秒'.format(secs)
 
 
+def _fmt_expires_at(ts) -> str:
+    """格式化到期时间。
+
+    用系统本地时间而不是 HA 的 time_zone：日志前缀走的就是系统时区，
+    两者不一致时（容器 TZ=Asia/Shanghai，而 HA time_zone 为 UTC）
+    日志里会出现"前缀 09:42、正文 01:42"这种对不上的情况。
+    """
+    if not ts:
+        return '未知'
+    try:
+        return time.strftime('%Y-%m-%d %H:%M', time.localtime(int(ts)))
+    except Exception:  # noqa: BLE001 时间格式化失败不该影响续期结果
+        return str(ts)
+
+
 async def token_updater(hass: HomeAssistant, entry: ConfigEntry, signal: threading.Event):
     """
     定时检查 token：失效就刷新并重载集成。
@@ -327,6 +342,14 @@ async def try_update_token(hass: HomeAssistant, entry: ConfigEntry):
         # 刷新接口返回的 accessToken 是 JWT，载荷里有 exp，能算出真实有效期
         cfg.expires_at = token_info.expires_at
     cfg.save()
+
+    # 续期成功必须留痕：启动阶段的续期原来完全静默，用户只能从"实体还在"
+    # 猜出来，排查"token 到底有没有自动续"时完全没有依据。
+    _LOGGER.info(
+        'token 已失效，已用 refresh_token 续期，新有效期至 %s(剩余 %s)',
+        _fmt_expires_at(cfg.expires_at),
+        _fmt_duration((cfg.expires_at or 0) - time.time()),
+    )
 
     return True
 
