@@ -1,4 +1,5 @@
 import logging
+import time
 from abc import ABC, abstractmethod
 
 from homeassistant.core import Event, callback
@@ -6,7 +7,11 @@ from homeassistant.helpers.entity import DeviceInfo, Entity
 from homeassistant.helpers.event import async_call_later
 
 from . import DOMAIN
-from .const import RECONCILE_DELAY
+from .const import (
+    OPTIMISTIC_PENDING_WINDOW,
+    RECONCILE_DELAY,
+    RECONCILE_RETRY,
+)
 from .core.attribute import TclAttribute
 from .core.client import TclClient
 from .core.device import TclDevice
@@ -56,8 +61,11 @@ class TclAbstractEntity(Entity, ABC):
         :param attributes:
         :return:
         """
-        # 先做本地乐观更新，不必等云端往返；真正的状态由控制回调/轮询校准
-        self._device.update_attributes(attributes)
+        # 先做本地乐观更新，不必等云端往返；真正的状态由设备上报校准。
+        # 保护表放在 device 上(所有实体共享)，避免多实体监听同一事件时
+        # 谁先合并谁后合并的竞态把乐观值覆盖掉。
+        self._device.register_optimistic(attributes, OPTIMISTIC_PENDING_WINDOW)
+        self._device.update_attributes(attributes, protect=False)
         fire_event(self.hass, EVENT_DEVICE_CONTROL, {
             'entityId': self.entity_id,
             'deviceId': self._device.id,
@@ -80,12 +88,13 @@ class TclAbstractEntity(Entity, ABC):
             pass
 
     @callback
-    def _schedule_reconcile(self) -> None:
+    def _schedule_reconcile(self, delay: float = RECONCILE_DELAY) -> None:
         """
-        命令下发后延迟从云端重新拉取一次状态。
+        命令下发后延迟从云端重新拉取状态，直到设备确认或超过保护窗口。
 
-        MQTT 的上报可能丢失或延迟，本地乐观更新也可能和真实状态不一致，
-        这里做一次校准，保证 UI 最终和设备一致。
+        单次校准不够：设备深睡时 30~60 秒才执行，3 秒时云端影子还是旧值。
+        因此只要保护表里还有未确认的属性就继续低频重拉，设备一上报
+        property/post 就会清掉保护表，循环自然结束。
         """
         if self._reconcile_cancel is not None:
             self._reconcile_cancel()
@@ -93,8 +102,11 @@ class TclAbstractEntity(Entity, ABC):
         async def _reconcile(_now) -> None:
             self._reconcile_cancel = None
             await self._device.async_refresh()
+            if (self._device.has_pending_optimistic
+                    and time.monotonic() < self._device.optimistic_deadline):
+                self._schedule_reconcile(RECONCILE_RETRY)
 
-        self._reconcile_cancel = async_call_later(self.hass, RECONCILE_DELAY, _reconcile)
+        self._reconcile_cancel = async_call_later(self.hass, delay, _reconcile)
 
     async def async_update(self) -> None:
         """
@@ -118,7 +130,8 @@ class TclAbstractEntity(Entity, ABC):
         def data_callback(event):
             data = event.data or {}
             if data.get('deviceId') == self._device.id:
-                # MQTT 上报的是增量，这里合并成完整快照，避免部分实体被"清零"
+                # MQTT 上报的是增量，这里合并成完整快照，避免部分实体被"清零"。
+                # protect=True(默认): 保护期内云端的旧值不会打回乐观状态。
                 self._device.update_attributes(data.get('attributes') or {})
                 self._attributes_data = self._device.attribute_snapshot_data
             self._update_value()
@@ -138,6 +151,15 @@ class TclAbstractEntity(Entity, ABC):
                 return
 
             attributes = e.data.get('attributes') or {}
+
+            # 先把乐观更新写进 HA，再发云端请求。
+            # 云控是"云端等设备确认"的模式：设备醒着时 0.2 秒返回，模块进入
+            # 深睡后要等 30~60 秒。如果先 await 再写状态，UI 会在这段时间里
+            # 一动不动，看起来就像"点了没生效"。
+            self._attributes_data = self._device.attribute_snapshot_data
+            self._update_value()
+            self._write_state()
+
             try:
                 await self._client.send_command(
                     self._client.getSession,
@@ -150,14 +172,11 @@ class TclAbstractEntity(Entity, ABC):
                     'Entity [%s] send command %s failed: %s',
                     self.entity_id, attributes, err
                 )
-                # 命令没发出去，立即用云端真实状态纠正本地的乐观更新
+                # 命令没发出去：撤销保护，立即用云端真实状态纠正乐观更新
+                self._device.clear_optimistic()
                 await self._device.async_refresh()
                 return
 
-            # 本地乐观更新(快照已在 _send_command 里合并)，避免 UI 等云端上报
-            self._attributes_data = self._device.attribute_snapshot_data
-            self._update_value()
-            self._write_state()
             # 延迟向云端校准一次真实状态
             self._schedule_reconcile()
 
