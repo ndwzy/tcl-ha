@@ -8,7 +8,7 @@ import ssl
 import threading
 import time
 import uuid
-from typing import List
+from typing import List, Optional
 
 import aiohttp
 import paho.mqtt.client as mqtt
@@ -22,6 +22,7 @@ from .event import fire_event
 from ..ac.panel_config_fallback import get_fallback_attributes, merge_attributes
 from ..const import (
     DOMAIN,
+    KEEPALIVE_ACTIVITY_KEY,
     MQTT_KEEPALIVE,
     MQTT_RETRY_MIN,
     MQTT_RETRY_MAX,
@@ -30,6 +31,22 @@ from ..const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _parse_msgid_time(msg_id) -> Optional[float]:
+    """
+    从 miniprogram_<随机>_<毫秒戳> 中解析出指令发出时刻(wall clock 秒)。
+
+    解析不出来时返回 None，此时调用方应放弃顺延保活而不是猜一个时间。
+    """
+    if not isinstance(msg_id, str):
+        return None
+    tail = msg_id.rsplit('_', 1)[-1]
+    if not tail.isdigit():
+        return None
+    value = int(tail)
+    return value / 1000.0 if value > 1e11 else float(value)
+
 
 APP_ID = '55141607047147220'
 APP_TENANT_ID = 'tcl'
@@ -831,13 +848,25 @@ class TclClient:
             _LOGGER.warning('设备 %s 控制回执失败: %s', device_id, payload)
 
         try:
-            self._hass.data.setdefault(DOMAIN, {})['last_set_reply'] = {
+            store = self._hass.data.setdefault(DOMAIN, {})
+            store['last_set_reply'] = {
                 'deviceId': device_id,
                 'code': code,
                 'ok': ok,
                 'payload': payload,
                 'time': time.time(),
             }
+            if ok and device_id:
+                # 一条成功回执 = 设备刚被真实触达过(HA、小程序或别的客户端发的都算)。
+                # 锚点取 msgId 里的"指令发出时刻"而非"回执到达时刻"：
+                # 1) 保活自己那条指令的时刻不晚于本轮发送时刻，不会把下一轮
+                #    顺延零点几秒，间隔仍严格等于 interval；
+                # 2) 设备深睡时回执可能晚到几十秒，也不会把间隔拖过 interval。
+                # 解析不出 msgId 就不更新锚点，保活退回固定 interval，安全。
+                sent_wall = _parse_msgid_time(payload.get('msgId'))
+                if sent_wall is not None:
+                    sent_mono = time.monotonic() - max(time.time() - sent_wall, 0.0)
+                    store.setdefault(KEEPALIVE_ACTIVITY_KEY, {})[device_id] = sent_mono
         except Exception:  # noqa: BLE001
             pass
 

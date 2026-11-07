@@ -21,7 +21,7 @@ from .const import (
     CONF_KEEPALIVE_INTERVAL,
     DEFAULT_KEEPALIVE_INTERVAL,
     MIN_KEEPALIVE_INTERVAL,
-    KEEPALIVE_JITTER_RATIO,
+    KEEPALIVE_ACTIVITY_KEY,
     KEEPALIVE_DEVICE_SPREAD_MIN,
     KEEPALIVE_DEVICE_SPREAD_MAX,
     KEEPALIVE_ATTRIBUTE,
@@ -76,6 +76,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     hass.data[DOMAIN]['devices'] = devices
     # 轮询以"最近一次收到 MQTT 消息"为基准，初始化成当前时间
     hass.data[DOMAIN]['last_mqtt_activity'] = time.monotonic()
+    # 保活以"各设备最后一次成功控制回执"为锚点，集成重载时重新起算
+    hass.data[DOMAIN][KEEPALIVE_ACTIVITY_KEY] = {}
 
     # 监听设备数据
     device_signal = threading.Event()
@@ -237,30 +239,41 @@ def _get_keepalive_interval(entry: ConfigEntry) -> int:
     return max(interval, MIN_KEEPALIVE_INTERVAL)
 
 
-def _keepalive_delay(interval: int) -> float:
+def _keepalive_schedule(device_ids: List[str], now: float, activity: dict,
+                        last_seen: dict, next_due: dict, interval: int):
     """
-    生成本轮保活等待时长(秒)，每轮重抽一次。
+    计算本轮该给哪些设备发保活、以及下一段等待时长。抽成纯函数便于验证硬约束。
 
-    区间 [interval * (1 - RATIO), interval]，刻意只做"负向抖动"：
-    保活间隔的上限决定设备会不会睡，实测 120s 稳定、240s 会出现 60s 延迟，
-    所以间隔绝不能随机到基准值以上。快照轮询兜底、慢一点无害，可以往后抖
-    (POLL_JITTER_MAX)；保活不行，两者抖动方向必须相反。
+    activity: device_id -> 最后一次成功指令的发出时刻(monotonic，按设备独立)。
+    收到新的外部指令就把该设备的下一轮顺延到 ts + interval，所以"两次
+    触达设备之间的间隔"永远不会超过 interval，也不会因别的设备活跃被拖长。
 
-    代价是均值低于基准(默认 105s)，请求量约 +14%；换来的是周期特征消失，
-    且安全边界完全不变(最大间隔仍恒等于 interval)。
+    返回 (due_ids, wait_seconds)：due_ids 非空时 wait=0，需要立刻发送。
     """
-    return interval * random.uniform(1.0 - KEEPALIVE_JITTER_RATIO, 1.0)
+    for device_id, ts in activity.items():
+        if device_id in next_due and ts > last_seen.get(device_id, 0.0):
+            last_seen[device_id] = ts
+            next_due[device_id] = ts + interval
+
+    due = [d for d in device_ids if next_due.get(d, float('inf')) <= now]
+    if due:
+        return due, 0.0
+    return [], max(min(next_due.values(), default=now) - now, 0.0)
 
 
 async def keepalive_updater(hass: HomeAssistant, entry: ConfigEntry,
                             targetDevices: List[TclDevice], signal: threading.Event):
     """
-    周期性保活，把空调的 WiFi 模块留在浅睡眠。
+    活动锚点式保活，把空调的 WiFi 模块留在浅睡眠。
 
     云控是"云端等设备确认"的模式，耗时随休眠深度变化：刚操作过 0.1~0.2 秒，
-    闲置 12 分钟后 60.3 秒（云端大约每 30 秒尝试唤醒一次，睡越深需要越多轮）。
-    这里每隔 interval 秒下发一条与当前值相同的电源指令：能触达设备、又不会
-    改变任何状态，把唤醒成本挪到后台，用户真正操作时就是秒回。
+    闲置久了要 30~60 秒（云端每 30 秒尝试唤醒一次）。这里保证"距离该设备
+    最后一次被成功触达不超过 interval 秒"，需要时下发一条与当前值相同的
+    电源指令：能触达设备、又不改变任何状态，用户真正操作时就是秒回。
+
+    触达时刻取自 set_reply 回执(按设备独立记录)，所以 HA、小程序、其他客户端
+    下发的指令都算；用户操作越频繁保活发得越少，周期也不再死板。失败或超时
+    的指令没有成功回执，不会错误地顺延。
 
     不用快照接口的原因是它读云端缓存(/device/status 恒定 0.2 秒)，根本不碰
     设备，对阻止休眠没有任何作用。
@@ -270,28 +283,51 @@ async def keepalive_updater(hass: HomeAssistant, entry: ConfigEntry,
         _LOGGER.info('device keepalive disabled')
         return
 
+    if not targetDevices:
+        _LOGGER.info('device keepalive disabled: no devices')
+        return
+
     _LOGGER.info(
-        'device keepalive enabled, base=%ss jitter=%.0f~%ss for %d device(s)',
-        interval, interval * (1.0 - KEEPALIVE_JITTER_RATIO),
+        'device keepalive enabled, up to %ss after last control reply for %d device(s)',
         interval, len(targetDevices)
     )
 
-    while not signal.is_set():
-        # 集成刚加载完先等一个间隔再发，避免启动瞬间就去打云端接口；
-        # 每轮重抽间隔，避免以固定节奏访问云端
-        delay = _keepalive_delay(interval)
-        _LOGGER.debug('keepalive next round in %.1fs', delay)
-        if await _interruptible_sleep(signal, delay):
-            break
+    state = hass.data.setdefault(DOMAIN, {})
+    activity = state.setdefault(KEEPALIVE_ACTIVITY_KEY, {})
+    device_ids = [device.id for device in targetDevices]
+    devices_by_id = {device.id: device for device in targetDevices}
+    started = time.monotonic()
+    # 集成刚加载完先等一个完整间隔，避免启动瞬间就去打云端接口
+    next_due = {device_id: started + interval for device_id in device_ids}
+    last_seen = {device_id: started for device_id in device_ids}
 
-        for index, device in enumerate(targetDevices):
+    while not signal.is_set():
+        now = time.monotonic()
+        due_ids, wait = _keepalive_schedule(
+            device_ids, now, activity, last_seen, next_due, interval
+        )
+        if not due_ids:
+            _LOGGER.debug('keepalive idle, next round in %.1fs', wait)
+            if await _interruptible_sleep(signal, wait):
+                break
+            continue
+
+        for index, device_id in enumerate(due_ids):
             if signal.is_set():
                 break
             if index:
-                # 多设备时错开一点，别让 N 条请求挤在同一瞬间
+                # 多设备同时到期时错开一点，别让 N 条请求挤在同一瞬间
                 if await _interruptible_sleep(signal, random.uniform(
                         KEEPALIVE_DEVICE_SPREAD_MIN, KEEPALIVE_DEVICE_SPREAD_MAX)):
                     break
+
+            device = devices_by_id[device_id]
+            # 先占位：无论发送成功、失败还是因缺少属性被跳过，本轮都不会
+            # 再被调度，杜绝空转。保活自己那条回执的锚点不晚于发送时刻，
+            # 不会顺延；只有这之后外部客户端下的指令才会把下一轮往后推。
+            sent_at = time.monotonic()
+            next_due[device_id] = sent_at + interval
+            last_seen[device_id] = sent_at
 
             snapshot = device.attribute_snapshot_data or {}
             if KEEPALIVE_ATTRIBUTE not in snapshot:
@@ -299,7 +335,6 @@ async def keepalive_updater(hass: HomeAssistant, entry: ConfigEntry,
                 continue
 
             client = device.getClient
-            started = time.monotonic()
             try:
                 await asyncio.wait_for(
                     client.send_command(
@@ -320,10 +355,10 @@ async def keepalive_updater(hass: HomeAssistant, entry: ConfigEntry,
                 _LOGGER.warning('keepalive %s failed: %s', device.id, err)
                 continue
 
-            elapsed = time.monotonic() - started
+            elapsed = time.monotonic() - sent_at
             if elapsed > KEEPALIVE_SLOW_THRESHOLD:
                 _LOGGER.warning(
-                    'keepalive %s took %.1fs, device was already asleep (interval too long?)',
+                    'keepalive %s took %.1fs, device was already asleep',
                     device.id, elapsed
                 )
             else:

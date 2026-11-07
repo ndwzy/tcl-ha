@@ -46,12 +46,14 @@ OPTIMISTIC_PENDING_WINDOW = 90
 CONF_KEEPALIVE_INTERVAL = 'keepalive_interval'
 DEFAULT_KEEPALIVE_INTERVAL = 120
 MIN_KEEPALIVE_INTERVAL = 60
-# 保活抖动：每轮重抽一次，实际间隔 = interval * [1 - RATIO, 1.0]。
-# 只往前提、绝不往后拖——间隔的上限决定设备会不会进入深睡，实测 120s 稳定、
-# 240s 会出现 60s 延迟，所以必须封顶在基准值上。快照轮询可以往后抖
-# (POLL_JITTER_MAX)，保活不行，两者的抖动方向必须相反。
-# 默认 0.25 → 90~120s，均值 105s，请求量约 +14%(720 → 822 条/天)。
-KEEPALIVE_JITTER_RATIO = 0.25
+# 保活调度：以"该设备最后一次成功控制回执"为锚点，固定间隔 120s。
+# 任何下发指令(用户在 HA/小程序点一下、HA 重启自发指令、保活自己)都会真正
+# 触达设备并产生 set_reply；外部指令的回执会把该设备的下一轮顺延，于是
+# 用户操作越频繁，保活发得越少，而"两次触达设备之间的最大间隔"恒等于
+# 120s，安全边界不变。相比无脑固定 120s，既省请求又把周期自然打散。
+# 锚点取回执 msgId 里的指令发出时刻，保活自己那条不会造成额外顺延。
+# 注意：快照轮询读云端缓存，不算触达设备，不能用来顺延。
+KEEPALIVE_ACTIVITY_KEY = 'last_control_activity'
 # 同一轮内多台设备之间的错峰(秒)，避免 N 台设备挤在同一瞬间请求云端
 KEEPALIVE_DEVICE_SPREAD_MIN = 0.2
 KEEPALIVE_DEVICE_SPREAD_MAX = 1.5
