@@ -18,6 +18,15 @@ from .const import (
     MIN_SCAN_INTERVAL,
     POLL_JITTER_MAX,
     POLL_WAIT_CHUNK,
+    CONF_KEEPALIVE_INTERVAL,
+    DEFAULT_KEEPALIVE_INTERVAL,
+    MIN_KEEPALIVE_INTERVAL,
+    KEEPALIVE_ACTIVITY_KEY,
+    KEEPALIVE_DEVICE_SPREAD_MIN,
+    KEEPALIVE_DEVICE_SPREAD_MAX,
+    KEEPALIVE_ATTRIBUTE,
+    KEEPALIVE_TIMEOUT,
+    KEEPALIVE_SLOW_THRESHOLD,
     TOKEN_REFRESH_MARGIN_RATIO,
     TOKEN_REFRESH_MARGIN_MIN,
     TOKEN_REFRESH_MARGIN_MAX,
@@ -67,6 +76,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     hass.data[DOMAIN]['devices'] = devices
     # 轮询以"最近一次收到 MQTT 消息"为基准，初始化成当前时间
     hass.data[DOMAIN]['last_mqtt_activity'] = time.monotonic()
+    # 保活以"各设备最后一次成功控制回执"为锚点，集成重载时重新起算
+    hass.data[DOMAIN][KEEPALIVE_ACTIVITY_KEY] = {}
 
     # 监听设备数据
     device_signal = threading.Event()
@@ -80,6 +91,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         'tcl-device-data-updater'
     )
     hass.data[DOMAIN]['signals'].append(device_updater_signal)
+
+    # 保活：定期向设备下发"同值"指令，把 WiFi 模块留在浅睡眠。
+    # 快照轮询读的是云端缓存，不会触达设备，所以必须单独跑一个任务。
+    keepalive_signal = threading.Event()
+    hass.async_create_background_task(
+        keepalive_updater(hass, entry, devices, keepalive_signal),
+        'tcl-device-keepalive'
+    )
+    hass.data[DOMAIN]['signals'].append(keepalive_signal)
 
     # 修正历史版本生成的错误实体ID域名(tcl.xxx -> select.tcl_xxx 等)，
     # 必须在实体创建之前完成，否则会留下两条指向同一 unique_id 的记录
@@ -139,12 +159,14 @@ def _get_scan_interval(entry: ConfigEntry) -> int:
     return max(interval, MIN_SCAN_INTERVAL)
 
 
-async def _interruptible_sleep(signal: threading.Event, seconds: int) -> bool:
-    """可被卸载信号打断的等待，返回 True 表示收到停止信号"""
-    for _ in range(max(int(seconds), 1)):
-        if signal.is_set():
-            return True
-        await asyncio.sleep(1)
+async def _interruptible_sleep(signal: threading.Event, seconds: float) -> bool:
+    """可被卸载信号打断的等待(支持小数秒)，返回 True 表示收到停止信号"""
+    deadline = time.monotonic() + max(seconds, 0)
+    while not signal.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(remaining, 1.0))
     return signal.is_set()
 
 
@@ -202,6 +224,145 @@ async def data_updater(hass: HomeAssistant, entry: ConfigEntry, targetDevices: L
 
         last_seen_activity = state.get('last_mqtt_activity', last_seen_activity)
         next_due = _next_due(time.monotonic())
+
+
+def _get_keepalive_interval(entry: ConfigEntry) -> int:
+    """获取保活间隔(秒)，0 表示关闭保活"""
+    raw = entry.options.get(CONF_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_INTERVAL)
+    try:
+        interval = int(raw)
+    except (TypeError, ValueError):
+        interval = DEFAULT_KEEPALIVE_INTERVAL
+
+    if interval <= 0:
+        return 0
+    return max(interval, MIN_KEEPALIVE_INTERVAL)
+
+
+def _keepalive_schedule(device_ids: List[str], now: float, activity: dict,
+                        last_seen: dict, next_due: dict, interval: int):
+    """
+    计算本轮该给哪些设备发保活、以及下一段等待时长。抽成纯函数便于验证硬约束。
+
+    activity: device_id -> 最后一次成功指令的发出时刻(monotonic，按设备独立)。
+    收到新的外部指令就把该设备的下一轮顺延到 ts + interval，所以"两次
+    触达设备之间的间隔"永远不会超过 interval，也不会因别的设备活跃被拖长。
+
+    返回 (due_ids, wait_seconds)：due_ids 非空时 wait=0，需要立刻发送。
+    """
+    for device_id, ts in activity.items():
+        if device_id in next_due and ts > last_seen.get(device_id, 0.0):
+            last_seen[device_id] = ts
+            next_due[device_id] = ts + interval
+
+    due = [d for d in device_ids if next_due.get(d, float('inf')) <= now]
+    if due:
+        return due, 0.0
+    return [], max(min(next_due.values(), default=now) - now, 0.0)
+
+
+async def keepalive_updater(hass: HomeAssistant, entry: ConfigEntry,
+                            targetDevices: List[TclDevice], signal: threading.Event):
+    """
+    活动锚点式保活，把空调的 WiFi 模块留在浅睡眠。
+
+    云控是"云端等设备确认"的模式，耗时随休眠深度变化：刚操作过 0.1~0.2 秒，
+    闲置久了要 30~60 秒（云端每 30 秒尝试唤醒一次）。这里保证"距离该设备
+    最后一次被成功触达不超过 interval 秒"，需要时下发一条与当前值相同的
+    电源指令：能触达设备、又不改变任何状态，用户真正操作时就是秒回。
+
+    触达时刻取自 set_reply 回执(按设备独立记录)，所以 HA、小程序、其他客户端
+    下发的指令都算；用户操作越频繁保活发得越少，周期也不再死板。失败或超时
+    的指令没有成功回执，不会错误地顺延。
+
+    不用快照接口的原因是它读云端缓存(/device/status 恒定 0.2 秒)，根本不碰
+    设备，对阻止休眠没有任何作用。
+    """
+    interval = _get_keepalive_interval(entry)
+    if interval <= 0:
+        _LOGGER.info('device keepalive disabled')
+        return
+
+    if not targetDevices:
+        _LOGGER.info('device keepalive disabled: no devices')
+        return
+
+    _LOGGER.info(
+        'device keepalive enabled, up to %ss after last control reply for %d device(s)',
+        interval, len(targetDevices)
+    )
+
+    state = hass.data.setdefault(DOMAIN, {})
+    activity = state.setdefault(KEEPALIVE_ACTIVITY_KEY, {})
+    device_ids = [device.id for device in targetDevices]
+    devices_by_id = {device.id: device for device in targetDevices}
+    started = time.monotonic()
+    # 集成刚加载完先等一个完整间隔，避免启动瞬间就去打云端接口
+    next_due = {device_id: started + interval for device_id in device_ids}
+    last_seen = {device_id: started for device_id in device_ids}
+
+    while not signal.is_set():
+        now = time.monotonic()
+        due_ids, wait = _keepalive_schedule(
+            device_ids, now, activity, last_seen, next_due, interval
+        )
+        if not due_ids:
+            _LOGGER.debug('keepalive idle, next round in %.1fs', wait)
+            if await _interruptible_sleep(signal, wait):
+                break
+            continue
+
+        for index, device_id in enumerate(due_ids):
+            if signal.is_set():
+                break
+            if index:
+                # 多设备同时到期时错开一点，别让 N 条请求挤在同一瞬间
+                if await _interruptible_sleep(signal, random.uniform(
+                        KEEPALIVE_DEVICE_SPREAD_MIN, KEEPALIVE_DEVICE_SPREAD_MAX)):
+                    break
+
+            device = devices_by_id[device_id]
+            # 先占位：无论发送成功、失败还是因缺少属性被跳过，本轮都不会
+            # 再被调度，杜绝空转。保活自己那条回执的锚点不晚于发送时刻，
+            # 不会顺延；只有这之后外部客户端下的指令才会把下一轮往后推。
+            sent_at = time.monotonic()
+            next_due[device_id] = sent_at + interval
+            last_seen[device_id] = sent_at
+
+            snapshot = device.attribute_snapshot_data or {}
+            if KEEPALIVE_ATTRIBUTE not in snapshot:
+                # 该设备没有这个属性，跳过而不是瞎猜一个
+                continue
+
+            client = device.getClient
+            try:
+                await asyncio.wait_for(
+                    client.send_command(
+                        client.getSession,
+                        client.getToken,
+                        device.id,
+                        {KEEPALIVE_ATTRIBUTE: snapshot[KEEPALIVE_ATTRIBUTE]},
+                    ),
+                    KEEPALIVE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    'keepalive %s timeout after %ss, device may be in deep sleep',
+                    device.id, KEEPALIVE_TIMEOUT
+                )
+                continue
+            except Exception as err:  # noqa: BLE001 单个设备失败不影响其他设备
+                _LOGGER.warning('keepalive %s failed: %s', device.id, err)
+                continue
+
+            elapsed = time.monotonic() - sent_at
+            if elapsed > KEEPALIVE_SLOW_THRESHOLD:
+                _LOGGER.warning(
+                    'keepalive %s took %.1fs, device was already asleep',
+                    device.id, elapsed
+                )
+            else:
+                _LOGGER.debug('keepalive %s ok in %.2fs', device.id, elapsed)
 
 
 def _refresh_margin(remaining: float) -> float:
