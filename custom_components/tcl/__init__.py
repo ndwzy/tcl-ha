@@ -18,6 +18,12 @@ from .const import (
     MIN_SCAN_INTERVAL,
     POLL_JITTER_MAX,
     POLL_WAIT_CHUNK,
+    CONF_KEEPALIVE_INTERVAL,
+    DEFAULT_KEEPALIVE_INTERVAL,
+    MIN_KEEPALIVE_INTERVAL,
+    KEEPALIVE_ATTRIBUTE,
+    KEEPALIVE_TIMEOUT,
+    KEEPALIVE_SLOW_THRESHOLD,
     TOKEN_REFRESH_MARGIN_RATIO,
     TOKEN_REFRESH_MARGIN_MIN,
     TOKEN_REFRESH_MARGIN_MAX,
@@ -80,6 +86,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         'tcl-device-data-updater'
     )
     hass.data[DOMAIN]['signals'].append(device_updater_signal)
+
+    # 保活：定期向设备下发"同值"指令，把 WiFi 模块留在浅睡眠。
+    # 快照轮询读的是云端缓存，不会触达设备，所以必须单独跑一个任务。
+    keepalive_signal = threading.Event()
+    hass.async_create_background_task(
+        keepalive_updater(hass, entry, devices, keepalive_signal),
+        'tcl-device-keepalive'
+    )
+    hass.data[DOMAIN]['signals'].append(keepalive_signal)
 
     # 修正历史版本生成的错误实体ID域名(tcl.xxx -> select.tcl_xxx 等)，
     # 必须在实体创建之前完成，否则会留下两条指向同一 unique_id 的记录
@@ -202,6 +217,88 @@ async def data_updater(hass: HomeAssistant, entry: ConfigEntry, targetDevices: L
 
         last_seen_activity = state.get('last_mqtt_activity', last_seen_activity)
         next_due = _next_due(time.monotonic())
+
+
+def _get_keepalive_interval(entry: ConfigEntry) -> int:
+    """获取保活间隔(秒)，0 表示关闭保活"""
+    raw = entry.options.get(CONF_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_INTERVAL)
+    try:
+        interval = int(raw)
+    except (TypeError, ValueError):
+        interval = DEFAULT_KEEPALIVE_INTERVAL
+
+    if interval <= 0:
+        return 0
+    return max(interval, MIN_KEEPALIVE_INTERVAL)
+
+
+async def keepalive_updater(hass: HomeAssistant, entry: ConfigEntry,
+                            targetDevices: List[TclDevice], signal: threading.Event):
+    """
+    周期性保活，把空调的 WiFi 模块留在浅睡眠。
+
+    云控是"云端等设备确认"的模式，耗时随休眠深度变化：刚操作过 0.1~0.2 秒，
+    闲置 12 分钟后 60.3 秒（云端大约每 30 秒尝试唤醒一次，睡越深需要越多轮）。
+    这里每隔 interval 秒下发一条与当前值相同的电源指令：能触达设备、又不会
+    改变任何状态，把唤醒成本挪到后台，用户真正操作时就是秒回。
+
+    不用快照接口的原因是它读云端缓存(/device/status 恒定 0.2 秒)，根本不碰
+    设备，对阻止休眠没有任何作用。
+    """
+    interval = _get_keepalive_interval(entry)
+    if interval <= 0:
+        _LOGGER.info('device keepalive disabled')
+        return
+
+    _LOGGER.info(
+        'device keepalive enabled, every %ss for %d device(s)',
+        interval, len(targetDevices)
+    )
+
+    while not signal.is_set():
+        # 集成刚加载完先等一个间隔再发，避免启动瞬间就去打云端接口
+        if await _interruptible_sleep(signal, interval):
+            break
+
+        for device in targetDevices:
+            if signal.is_set():
+                break
+
+            snapshot = device.attribute_snapshot_data or {}
+            if KEEPALIVE_ATTRIBUTE not in snapshot:
+                # 该设备没有这个属性，跳过而不是瞎猜一个
+                continue
+
+            client = device.getClient
+            started = time.monotonic()
+            try:
+                await asyncio.wait_for(
+                    client.send_command(
+                        client.getSession,
+                        client.getToken,
+                        device.id,
+                        {KEEPALIVE_ATTRIBUTE: snapshot[KEEPALIVE_ATTRIBUTE]},
+                    ),
+                    KEEPALIVE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    'keepalive %s timeout after %ss, device may be in deep sleep',
+                    device.id, KEEPALIVE_TIMEOUT
+                )
+                continue
+            except Exception as err:  # noqa: BLE001 单个设备失败不影响其他设备
+                _LOGGER.warning('keepalive %s failed: %s', device.id, err)
+                continue
+
+            elapsed = time.monotonic() - started
+            if elapsed > KEEPALIVE_SLOW_THRESHOLD:
+                _LOGGER.warning(
+                    'keepalive %s took %.1fs, device was already asleep (interval too long?)',
+                    device.id, elapsed
+                )
+            else:
+                _LOGGER.debug('keepalive %s ok in %.2fs', device.id, elapsed)
 
 
 def _refresh_margin(remaining: float) -> float:

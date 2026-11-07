@@ -138,6 +138,15 @@ class TclAbstractEntity(Entity, ABC):
                 return
 
             attributes = e.data.get('attributes') or {}
+
+            # 先把乐观更新写进 HA，再发云端请求。
+            # 云控是"云端等设备确认"的模式：设备醒着时 0.2 秒返回，模块进入
+            # 深睡后要等 30~60 秒。如果先 await 再写状态，UI 会在这段时间里
+            # 一动不动，看起来就像"点了没生效"。
+            self._attributes_data = self._device.attribute_snapshot_data
+            self._update_value()
+            self._write_state()
+
             try:
                 await self._client.send_command(
                     self._client.getSession,
@@ -154,10 +163,6 @@ class TclAbstractEntity(Entity, ABC):
                 await self._device.async_refresh()
                 return
 
-            # 本地乐观更新(快照已在 _send_command 里合并)，避免 UI 等云端上报
-            self._attributes_data = self._device.attribute_snapshot_data
-            self._update_value()
-            self._write_state()
             # 延迟向云端校准一次真实状态
             self._schedule_reconcile()
 
