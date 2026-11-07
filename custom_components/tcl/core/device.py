@@ -58,6 +58,45 @@ class TclDevice:
         # 可以在这里添加数据验证逻辑
         self._attribute_snapshot_data = new_data
 
+    def update_attributes(self, patch: dict) -> dict:
+        """把增量属性合并进快照(原地更新，所有实体共享同一份数据)"""
+        data = self._attribute_snapshot_data
+        for key, value in patch.items():
+            data[str(key)] = value
+        self._attribute_snapshot_data = data
+        return data
+
+    async def async_refresh(self) -> bool:
+        """
+        主动从云端拉取一次设备最新状态，并广播 device_data_changed 事件。
+
+        MQTT 只在设备主动上报时才有消息，用遥控器/空调面板操作时经常
+        不上报，必须靠这里补一次状态，否则 HA 会一直停留在旧状态。
+        """
+        # 局部导入避免模块循环引用
+        from .event import EVENT_DEVICE_DATA_CHANGED, fire_event
+
+        try:
+            snapshot = await self._client.get_device_snapshot_data(self.id)
+        except Exception as err:  # noqa: BLE001 云端接口异常不应影响其他设备
+            _LOGGER.debug('Tcl device %s refresh snapshot failed: %s', self.id, err)
+            return False
+
+        if not snapshot:
+            _LOGGER.debug('Tcl device %s refresh returned empty snapshot', self.id)
+            return False
+
+        self.update_attributes(snapshot)
+        _LOGGER.debug(
+            'Tcl device %s refreshed from cloud, %d attributes',
+            self.id, len(snapshot)
+        )
+        fire_event(self._client.hass, EVENT_DEVICE_DATA_CHANGED, {
+            'deviceId': self.id,
+            'attributes': snapshot
+        })
+        return True
+
     async def async_init(self):
         # 解析Attribute
         # noinspection PyBroadException
