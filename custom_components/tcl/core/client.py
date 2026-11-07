@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import functools
 import json
 import logging
 import random
@@ -6,8 +8,9 @@ import ssl
 import threading
 import time
 import uuid
-from typing import List
+from typing import List, Optional
 
+import aiohttp
 import paho.mqtt.client as mqtt
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -17,8 +20,33 @@ from .device import TclDevice
 from .event import EVENT_DEVICE_DATA_CHANGED, EVENT_GATEWAY_STATUS_CHANGED
 from .event import fire_event
 from ..ac.panel_config_fallback import get_fallback_attributes, merge_attributes
+from ..const import (
+    DOMAIN,
+    KEEPALIVE_ACTIVITY_KEY,
+    MQTT_KEEPALIVE,
+    MQTT_RETRY_MIN,
+    MQTT_RETRY_MAX,
+    MQTT_DISCONNECT_GRACE,
+    MQTT_SILENT_TIMEOUT,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _parse_msgid_time(msg_id) -> Optional[float]:
+    """
+    从 miniprogram_<随机>_<毫秒戳> 中解析出指令发出时刻(wall clock 秒)。
+
+    解析不出来时返回 None，此时调用方应放弃顺延保活而不是猜一个时间。
+    """
+    if not isinstance(msg_id, str):
+        return None
+    tail = msg_id.rsplit('_', 1)[-1]
+    if not tail.isdigit():
+        return None
+    value = int(tail)
+    return value / 1000.0 if value > 1e11 else float(value)
+
 
 APP_ID = '55141607047147220'
 APP_TENANT_ID = 'tcl'
@@ -57,11 +85,105 @@ def random_str(length: int = 32) -> str:
     return ''.join(random.choice('abcdef1234567890') for _ in range(length))
 
 
+async def _sleep_or_stop(signal: threading.Event, seconds: float) -> bool:
+    """可被停止信号打断的等待，返回 True 表示收到了停止信号"""
+    deadline = time.monotonic() + max(float(seconds), 0)
+    while True:
+        if signal.is_set():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(remaining, 1.0))
+
+
+def _mark_mqtt_activity(hass: HomeAssistant) -> None:
+    """
+    记录最近一次收到 MQTT 消息的时刻。
+
+    轮询任务以此为基准顺延，设备在主动上报时就不必再去云端拉快照。
+    """
+    if hass is None:
+        return
+    try:
+        hass.data.setdefault(DOMAIN, {})['last_mqtt_activity'] = time.monotonic()
+    except Exception:  # noqa: BLE001 记录时间戳不允许影响消息处理
+        pass
+
+
+
+def _parse_jwt_exp(token: str) -> int:
+    """
+    从 JWT 载荷里取过期时间(秒级时间戳)，取不到返回 0。
+
+    refreshToken 接口返回的 accessToken 是标准 JWT，载荷里的 exp 就是有效期
+    (实测 30 天)；短信/密码登录拿到的是小程序渠道的老格式串，解析不出来，
+    返回 0 表示"有效期未知"，由上层退化为探活。
+    """
+    try:
+        payload = token.split('.')[1]
+        payload += '=' * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        exp = data.get('exp')
+        return int(exp) if exp else 0
+    except Exception:  # noqa: BLE001 非 JWT 或字段缺失都按"有效期未知"处理
+        return 0
+
+
+def account_id_from_refresh_token(token: str) -> str:
+    """
+    从 refreshToken 里解析 accountId，省掉用户手工填写。
+
+    refreshToken 是 RS256 JWT，载荷形如
+        {"exp":..., "iat":..., "refreshToken": {"token": "<内层 JWT>"}}
+    内层 JWT 的载荷里有 userInfo（一个 JSON 字符串），accountId 就在里面；
+    实测也可以直接取载荷里的 sub / accountId。
+
+    解析失败返回空串，调用方按"需要手工填写"处理。
+    """
+    def _payload(raw: str) -> dict:
+        seg = raw.split('.')[1]
+        seg += '=' * (-len(seg) % 4)
+        return json.loads(base64.urlsafe_b64decode(seg))
+
+    try:
+        outer = _payload(token)
+    except Exception:  # noqa: BLE001 非 JWT 直接放弃
+        return ''
+
+    # 1) 内层 token -> userInfo -> accountId
+    inner_token = None
+    nested = outer.get('refreshToken')
+    if isinstance(nested, dict):
+        inner_token = nested.get('token')
+    elif isinstance(nested, str):
+        inner_token = nested
+    if inner_token:
+        try:
+            inner = _payload(inner_token)
+            user_info = inner.get('userInfo')
+            if isinstance(user_info, str):
+                user_info = json.loads(user_info)
+            if isinstance(user_info, dict) and user_info.get('accountId'):
+                return str(user_info['accountId'])
+            if inner.get('sub'):
+                return str(inner['sub'])
+        except Exception:  # noqa: BLE001 内层结构变化时继续往后兜
+            pass
+
+    # 2) 直接取外层字段
+    for key in ('accountId', 'sub', 'userId'):
+        if outer.get(key):
+            return str(outer[key])
+    return ''
+
+
 class TokenInfo:
 
-    def __init__(self, token: str, refresh_token: str):
+    def __init__(self, token: str, refresh_token: str, expires_at: int = 0):
         self._token = token
         self._refresh_token = refresh_token
+        self._expires_at = expires_at
 
     @property
     def token(self) -> str:
@@ -71,6 +193,11 @@ class TokenInfo:
     def refresh_token(self) -> str:
         return self._refresh_token
 
+    @property
+    def expires_at(self) -> int:
+        """accessToken 过期时间(秒级时间戳)，0 表示未知"""
+        return self._expires_at
+
 
 class TclClientException(Exception):
     pass
@@ -78,9 +205,14 @@ class TclClientException(Exception):
 
 class TclClient:
 
-    def __init__(self, hass: HomeAssistant, accountId: str, token: str):
+    def __init__(self, hass: HomeAssistant, accountId: str, token: str,
+                 refresh_token: str = None, entry=None):
         self._account_id = accountId
         self._token = token
+        self._refresh_token = refresh_token
+        # accessToken 的过期时间(秒级时间戳)，0 表示未知(JWT 里取不到)
+        self._expires_at = 0
+        self._entry = entry
         self._hass = hass
         self._session = async_get_clientsession(hass)
         self._user_id = None
@@ -128,15 +260,76 @@ class TclClient:
             "refreshToken": refresh_token
         }
 
-        async with self._session.get(url=api_url, headers=api_headers) as response:
+        async with self._session.get(
+            url=api_url,
+            headers=api_headers,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as response:
             token_info = await response.json()
             if 'accessToken' in token_info:
                 return TokenInfo(
                     token_info['accessToken'],
-                    token_info['refreshToken']
+                    token_info['refreshToken'],
+                    _parse_jwt_exp(token_info['accessToken'])
                 )
             else:
                 raise TclClientException('接口返回异常: ' + str(token_info))
+
+    async def ensure_valid_token(self) -> bool:
+        """
+        确认当前 token 仍然可用，失效则用 refresh_token 换新。
+
+        在重建 MQTT 连接之前调用：否则凭据过期时会拿着废 token 无限重试。
+        刷新成功后会写回配置项（会触发集成重载），返回 True 表示刷新过。
+        """
+        try:
+            await asyncio.wait_for(self.get_user_info(), 20)
+            return False
+        except TclClientException:
+            pass  # 明确的鉴权失败，需要刷新
+        except asyncio.TimeoutError:
+            _LOGGER.debug('检查 token 超时，跳过刷新')
+            return False
+        except Exception as err:  # noqa: BLE001 网络抖动不应触发换 token
+            _LOGGER.debug('检查 token 时网络异常，跳过刷新: %s', err)
+            return False
+
+        if not self._refresh_token:
+            _LOGGER.warning('token 已失效且本地没有 refresh_token，请在集成设置中重新登录')
+            return False
+
+        try:
+            token_info = await asyncio.wait_for(self.refresh_token(self._refresh_token), 20)
+        except Exception as err:  # noqa: BLE001 刷新失败交给外层退避重试
+            _LOGGER.warning('刷新 token 失败: %s', err)
+            return False
+
+        self._token = token_info.token
+        self._refresh_token = token_info.refresh_token
+        self._expires_at = token_info.expires_at
+        self._persist_token()
+        if self._expires_at:
+            expire_text = time.strftime('%Y-%m-%d %H:%M', time.localtime(self._expires_at))
+        else:
+            expire_text = '未知(接口未返回有效期)'
+        _LOGGER.info('token 已刷新，有效期至 %s，将使用新凭据重建 MQTT 连接', expire_text)
+        return True
+
+    def _persist_token(self) -> None:
+        """把刷新后的 token 写回配置项，避免重启后仍使用旧的 refresh_token"""
+        if self._entry is None or self._hass is None:
+            return
+        try:
+            from .config import AccountConfig
+
+            cfg = AccountConfig(self._hass, self._entry)
+            cfg.token = self._token
+            cfg.refresh_token = self._refresh_token
+            if self._expires_at:
+                cfg.expires_at = self._expires_at
+            cfg.save()
+        except Exception as err:  # noqa: BLE001 持久化失败不影响内存中的新 token
+            _LOGGER.warning('保存刷新后的 token 失败: %s', err)
 
     async def get_user_info(self) -> dict:
         """
@@ -148,6 +341,9 @@ class TclClient:
         api_headers = {
             "Host": "cn.account.tcl.com",
             "TCL-Authorization": self._token,
+            # 刷新接口换来的是标准 JWT，实测要同时带 token 头服务端才认；
+            # 老的小程序渠道 token 两个头都带也正常，统一都给上
+            "token": self._token,
             "xweb_xhr": "1",
             "t-app-version": APP_VERSION,
             "t-store-uuid": APP_UUID,
@@ -156,15 +352,21 @@ class TclClient:
             "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
             "Referer": "https://servicewechat.com/wxed3f11c6ee178737/243/page-frame.html"
         }
-        async with self._session.get(url=api_url, headers=api_headers) as response:
+        # 显式超时：这个调用在集成 setup 阶段被串行等待，卡住会拖死整个启动流程。
+        # 超时抛 asyncio.TimeoutError，交给上层按"网络问题"处理，不要当成鉴权失败
+        async with self._session.get(
+            url=api_url,
+            headers=api_headers,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
             content = await response.json(content_type=None)
-            if 'FAILED' in content['status']:
-                raise TclClientException('Error getting user info, error: {}'.format(content['failCause']))
-            userinfo = content['data']
+            if 'FAILED' in str(content.get('status') or ''):
+                raise TclClientException('Error getting user info, error: {}'.format(content.get('failCause')))
+            userinfo = content.get('data') or {}
             return {
-                'accountId': userinfo['accountId'],
-                'mobile': userinfo['phone'],
-                'username': userinfo['username']
+                'accountId': userinfo.get('accountId'),
+                'mobile': userinfo.get('phone'),
+                'username': userinfo.get('username')
             }
 
     def _get_io_headers(self, content_type: str = "application/x-www-form-urlencoded;charset=utf-8") -> dict:
@@ -197,7 +399,11 @@ class TclClient:
         获取设备列表
         """
         api_headers = self._get_io_headers()
-        async with self._session.get(url=GET_DEVICES_API, headers=api_headers) as response:
+        async with self._session.get(
+            url=GET_DEVICES_API,
+            headers=api_headers,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as response:
             content = await response.json(content_type=None)
             self._assert_response_successful(content)
 
@@ -304,163 +510,439 @@ class TclClient:
         api_headers = self._get_io_headers("application/json;charset=UTF-8")
 
         api_body = {"deviceId": deviceId}
-        async with self._session.post(url=DEVICE_STATUS_API, headers=api_headers, json=api_body) as response:
-            content = await response.json(content_type=None)
-            self._assert_response_successful(content)
-            if 'status' not in content['data']:
-                _LOGGER.warning("Device {} get digital snapshot data fail. response: {}".format(
-                    deviceId,
-                    json.dumps(content, ensure_ascii=False)
-                ))
-                return {}
-            return content['data']['status']
+        # 显式设置超时：轮询任务串行拉取，一次请求卡住会把整个轮询循环拖死，
+        # 表现为实体状态长时间不再更新
+        try:
+            async with self._session.post(
+                url=DEVICE_STATUS_API,
+                headers=api_headers,
+                json=api_body,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                content = await response.json(content_type=None)
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Device %s snapshot request timeout (15s)", deviceId)
+            return {}
+        self._assert_response_successful(content)
+        if 'status' not in content['data']:
+            _LOGGER.warning("Device {} get digital snapshot data fail. response: {}".format(
+                deviceId,
+                json.dumps(content, ensure_ascii=False)
+            ))
+            return {}
+        return content['data']['status']
 
     async def listen_devices(self, targetDevices: List[TclDevice], signal: threading.Event):
         """
-        监听设备数据变化（使用MQTT协议）
+        监听设备数据变化（MQTT over WebSocket）。
+
+        外层循环负责“取配置 -> 建连 -> 监控 -> 必要时重建”，任何一步失败都只是
+        退避重试，不会让监听任务结束；只有集成卸载时的停止信号才能真正退出。
         """
         process_id = str(uuid.uuid4())
         self._hass.data['current_listen_devices_process_id'] = process_id
-        mqtt_config = await self.get_mqtt_config()
-        # MQTT配置
-        MQTT_HOST = "iotws-prod.tcliot.com"
-        MQTT_PORT = 443
-        USER_ID = mqtt_config['userId']
-        self._user_id = USER_ID
-        ACCESS_TOKEN = self._token
-        DEVICE_LIST = [{'deviceId': device.id, 'productKey': device.product_key} for device in targetDevices]
 
-        # 生成clientId
-        random_str = str(random.randint(1000, 9999))
-        timestamp = str(int(time.time() * 1000))
-        CLIENT_ID = f"{USER_ID}@miniprogram@{random_str}{timestamp}"
+        device_list = [
+            {'deviceId': device.id, 'productKey': device.product_key}
+            for device in targetDevices
+        ]
+        # 设备真实存在的属性 key，用于过滤通知消息里的无关字段
+        known_keys = {
+            device.id: {attribute.key for attribute in device.attributes}
+            for device in targetDevices
+        }
 
-        # 创建MQTT客户端
-        client = mqtt.Client(client_id=CLIENT_ID,
-                             clean_session=True,
-                             protocol=mqtt.MQTTv311,
-                             transport="websockets")
+        retry_delay = MQTT_RETRY_MIN
 
-        # 设置认证信息
-        client.username_pw_set(username=USER_ID, password=ACCESS_TOKEN)
+        while not signal.is_set():
+            try:
+                mqtt_config = await asyncio.wait_for(self.get_mqtt_config(), 30)
+            except Exception as err:  # noqa: BLE001 拿不到配置也要重试，不能就此罢休
+                _LOGGER.warning('获取 MQTT 配置失败，%ss 后重试: %s', retry_delay, err)
+                self._notify_gateway_down(retry_delay)
+                if await _sleep_or_stop(signal, retry_delay):
+                    break
+                retry_delay = min(retry_delay * 2, MQTT_RETRY_MAX)
+                continue
 
-        # 设置TLS/SSL
+            ever_connected, reason = await self._mqtt_session(
+                mqtt_config, device_list, known_keys, targetDevices, signal, process_id
+            )
+            if reason == 'signal' or signal.is_set():
+                break
+
+            # 需要重建：先确认凭据没过期，否则重建后依旧会被服务端拒绝
+            await self.ensure_valid_token()
+
+            if ever_connected:
+                # 连上过说明网络和服务端都是通的，重建时从最小退避开始
+                retry_delay = MQTT_RETRY_MIN
+            _LOGGER.warning('MQTT 连接需要重建，%ss 后重试', retry_delay)
+            self._notify_gateway_down(retry_delay)
+            if await _sleep_or_stop(signal, retry_delay):
+                break
+            retry_delay = min(retry_delay * 2, MQTT_RETRY_MAX)
+
+        if process_id == self._hass.data.get('current_listen_devices_process_id'):
+            fire_event(self._hass, EVENT_GATEWAY_STATUS_CHANGED, {'status': False})
+        _LOGGER.info('listen device stopped.')
+
+    def _notify_gateway_down(self, retry_delay: int) -> None:
+        """
+        短暂的重建不通知 UI，避免实体在可用/不可用之间闪烁；
+        退避时间已经拉长，说明短时间内恢复不了，才标记为不可用。
+        """
+        if retry_delay < MQTT_DISCONNECT_GRACE:
+            return
+        fire_event(self._hass, EVENT_GATEWAY_STATUS_CHANGED, {'status': False})
+
+    async def _mqtt_session(self, mqtt_config, device_list, known_keys,
+                            targetDevices, signal, process_id):
+        """
+        建立并维持一条 MQTT 连接。返回 (是否连接成功过, 结束原因)。
+
+        结束原因为 'signal'（收到停止信号）或 'reset'（连接需要整体重建：
+        长时间连不上，或者连上了但长时间收不到任何消息）。
+        """
+        host = 'iotws-prod.tcliot.com'
+        port = 443
+        user_id = mqtt_config['userId']
+        self._user_id = user_id
+
         if self.ssl_context is None:
             await self.initialize()
-        await self.hass.async_add_executor_job(
-            client.tls_set_context,
-            self.ssl_context
-        )
 
-        # 设置WebSocket路径和自动重连
-        client.ws_set_options(path="/mqtt")
-        client.reconnect_delay_set(min_delay=1, max_delay=30)
+        stats = {
+            'connected': False,
+            'ever_connected': False,
+            'last_inbound': time.monotonic(),
+            'last_disconnect': time.monotonic(),
+            'suppress_status': False,
+        }
 
-        # 回调函数定义（保持不变）
         def on_connect(client, userdata, flags, rc):
-            _LOGGER.info(f"MQTT连接结果: {rc}")
-            if rc == 0:
-                _LOGGER.info("成功连接到MQTT服务器")
-                # 订阅所有设备的状态
-                for device in DEVICE_LIST:
-                    device_id = device['deviceId']
-                    product_key = device['productKey']
-                    # 订阅设备属性状态
-                    property_topic = f"/sys/{product_key}/{device_id}/thing/event/property/post"
-                    client.subscribe(property_topic, qos=1)
-                    _LOGGER.debug(f"已订阅设备属性主题: {property_topic}")
+            if rc != 0:
+                # 4/5 通常代表用户名密码/token 无效，重建前会尝试刷新 token
+                _LOGGER.warning('MQTT 连接被服务器拒绝，返回码 %s', rc)
+                return
 
-                    # 订阅设备上下线状态
-                    status_topic = f"/sys/{product_key}/{device_id}/thing/event/+"
-                    client.subscribe(status_topic, qos=1)
-                    _LOGGER.debug(f"已订阅设备状态主题: {status_topic}")
+            _LOGGER.info('成功连接到MQTT服务器')
+            stats['connected'] = True
+            stats['ever_connected'] = True
+            stats['last_disconnect'] = None
+            stats['last_inbound'] = time.monotonic()
 
-                fire_event(self._hass, EVENT_GATEWAY_STATUS_CHANGED, {
-                    'status': True
-                })
+            for device in device_list:
+                device_id = device['deviceId']
+                product_key = device['productKey']
+                subscriptions = (
+                    # 属性上报：设备/面板/遥控器改变状态后推送
+                    (f"/sys/{product_key}/{device_id}/thing/event/property/post", '属性上报'),
+                    # 设备级事件（含上下线等）。单层通配不会与上面重复订阅
+                    (f"/sys/{product_key}/{device_id}/thing/event/+", '设备事件'),
+                    # 控制回执：确认下发的命令是否被设备接受
+                    (f"/sys/{product_key}/{device_id}/thing/service/property/set_reply", '控制回执'),
+                )
+                for topic, label in subscriptions:
+                    client.subscribe(topic, qos=1)
+                    _LOGGER.debug('已订阅%s主题: %s', label, topic)
 
-        def on_message(client, userdata,msg):
-            _LOGGER.debug(f"收到消息 主题:{msg.topic} 内容:{msg.payload.decode()}")
+            # 账号级通知（上下线/告警）。小程序订阅的是 5 层主题 /sys/{userId}/...
+            notice_topic = f"/sys/{user_id}/thing/event/pushnotice"
+            client.subscribe(notice_topic, qos=1)
+            _LOGGER.debug('已订阅账号通知主题: %s', notice_topic)
 
-            # 处理不同类型的消息
+            fire_event(self._hass, EVENT_GATEWAY_STATUS_CHANGED, {'status': True})
+
+            # 断线期间可能漏掉状态变化，连上后主动拉一次快照补齐
+            for device in targetDevices:
+                try:
+                    self._hass.loop.call_soon_threadsafe(
+                        self._hass.async_create_task, device.async_refresh()
+                    )
+                except Exception:  # noqa: BLE001 回调线程不能抛异常，否则会打断网络循环
+                    _LOGGER.exception('schedule refresh for device %s failed', device.id)
+
+        def on_message(client, userdata, msg):
+            stats['last_inbound'] = time.monotonic()
+            _mark_mqtt_activity(self._hass)
+
             try:
-                payload = json.loads(msg.payload.decode())
+                payload_raw = msg.payload.decode()
+            except Exception:  # noqa: BLE001
+                payload_raw = repr(msg.payload)
+            _LOGGER.debug('收到消息 主题:%s 内容:%s', msg.topic, payload_raw)
 
-                # 处理设备属性消息
-                if "/thing/event/property/post" in msg.topic:
-                    # 从主题中提取设备ID
-                    parts = msg.topic.split('/')
-                    if len(parts) >= 4:
-                        device_id = parts[3]
-                        # _LOGGER.debug(f"设备 {device_id} 属性更新: {payload}")
+            try:
+                payload = json.loads(payload_raw)
+            except ValueError:
+                _LOGGER.warning('MQTT 消息不是合法 JSON，主题:%s 内容:%s', msg.topic, payload_raw[:300])
+                return
+            if not isinstance(payload, dict):
+                return
 
-                        # 提取属性值
-                        if "params" in payload:
-                            attributes = {}
-                            for key, value in payload["params"].items():
-                                attributes[key] = value['value']
-
-                            # 触发设备数据变化事件
-                            fire_event(self._hass, EVENT_DEVICE_DATA_CHANGED, {
-                                'deviceId': device_id,
-                                'attributes': attributes
-                            })
-
-                # 处理设备事件消息
-                elif "/thing/event/pushnotice" in msg.topic:
-                    if "params" in payload and "value" in payload["params"]:
-                        event_value = payload["params"]["value"]
-
-                        # 处理设备上下线事件
-                        if "status" in event_value:
-                            device_id = event_value.get("deviceId", "未知设备")
-                            status = event_value["status"]
-                            _LOGGER.info(f"设备 {device_id} 状态变更: {status}")
-            except json.JSONDecodeError:
-                _LOGGER.error(f"消息格式错误: {msg.payload.decode()}")
-            except Exception as e:
-                _LOGGER.exception(f"处理消息时出错: {e}")
+            try:
+                if '/thing/event/property/post' in msg.topic:
+                    self._handle_property_post(msg.topic, payload)
+                elif '/thing/service/property/set_reply' in msg.topic:
+                    self._handle_set_reply(msg.topic, payload)
+                elif '/thing/event/pushnotice' in msg.topic:
+                    self._handle_push_notice(msg.topic, payload, known_keys)
+                else:
+                    _LOGGER.debug('未处理的主题: %s', msg.topic)
+            except Exception as err:  # noqa: BLE001 单条消息处理失败不能中断网络循环
+                _LOGGER.exception('处理消息时出错，主题:%s 错误:%s', msg.topic, err)
 
         def on_disconnect(client, userdata, rc):
-            _LOGGER.info(f"断开连接，状态码: {rc}")
-            if rc != 0:
-                _LOGGER.warning("意外断开连接")
-                if process_id == self._hass.data['current_listen_devices_process_id']:
-                    fire_event(self._hass, EVENT_GATEWAY_STATUS_CHANGED, {
-                        'status': False
-                    })
+            stats['connected'] = False
+            stats['last_disconnect'] = time.monotonic()
 
-        # 设置回调函数
-        client.on_connect = on_connect
-        client.on_message = on_message
-        client.on_disconnect = on_disconnect
+            if rc == 0:
+                _LOGGER.info('MQTT 连接已关闭')
+                return
+
+            _LOGGER.warning('MQTT 意外断开（rc=%s），等待自动重连', rc)
+            if (not stats['suppress_status']
+                    and process_id == self._hass.data.get('current_listen_devices_process_id')):
+                fire_event(self._hass, EVENT_GATEWAY_STATUS_CHANGED, {'status': False})
+
+        client = None
+        try:
+            # ---- 首次建连：失败不放弃，指数退避重试 ----
+            delay = MQTT_RETRY_MIN
+            while True:
+                if signal.is_set():
+                    return stats['ever_connected'], 'signal'
+
+                # 每次重试都用全新的客户端，避免失败后残留半初始化的状态
+                client = self._build_mqtt_client(user_id)
+                client.on_connect = on_connect
+                client.on_message = on_message
+                client.on_disconnect = on_disconnect
+
+                try:
+                    await self._hass.async_add_executor_job(
+                        functools.partial(client.connect, host, port, MQTT_KEEPALIVE)
+                    )
+                    break
+                except Exception as err:  # noqa: BLE001 网络/DNS/证书问题一律重试
+                    _LOGGER.warning('MQTT 连接失败，%ss 后重试: %s', delay, err)
+                    self._close_client(client)
+                    client = None
+                    if await _sleep_or_stop(signal, delay):
+                        return stats['ever_connected'], 'signal'
+                    delay = min(delay * 2, 60)
+
+            client.loop_start()
+            _LOGGER.debug('MQTT 网络循环已启动，等待连接结果')
+
+            # ---- 看门狗：连接是否真的还活着 ----
+            while not signal.is_set():
+                # 用可打断的等待，卸载时能立刻退出，不必干等一轮
+                if await _sleep_or_stop(signal, 5):
+                    return stats['ever_connected'], 'signal'
+                now = time.monotonic()
+
+                if stats['connected']:
+                    silent = now - stats['last_inbound']
+                    if silent > MQTT_SILENT_TIMEOUT:
+                        # keepalive 没报警但确实收不到东西，重建一次最稳妥
+                        _LOGGER.warning(
+                            'MQTT 保持连接但 %d 分钟没有收到任何消息，主动重建连接',
+                            int(silent // 60)
+                        )
+                        return stats['ever_connected'], 'reset'
+                    continue
+
+                since = stats['last_disconnect'] or now
+                if now - since > MQTT_DISCONNECT_GRACE:
+                    _LOGGER.warning('MQTT 断开超过 %ss 仍未恢复，重建连接', MQTT_DISCONNECT_GRACE)
+                    return stats['ever_connected'], 'reset'
+
+            return stats['ever_connected'], 'signal'
+        finally:
+            # 主动重建时不希望实体在可用/不可用之间闪烁
+            stats['suppress_status'] = True
+            self._close_client(client)
+
+    def _build_mqtt_client(self, user_id: str):
+        """创建一个配置好传输层与凭据的 MQTT 客户端（尚未连接）"""
+        # clientId 每轮重新生成，避免与上一轮的会话互相抢占
+        suffix = str(random.randint(1000, 9999))
+        timestamp = str(int(time.time() * 1000))
+        client_id = f"{user_id}@miniprogram@{suffix}{timestamp}"
+
+        # paho-mqtt 2.x 要求显式传入回调 API 版本，1.x 没有这个参数，这里做兼容
+        try:
+            client = mqtt.Client(
+                mqtt.CallbackAPIVersion.VERSION1,
+                client_id=client_id,
+                clean_session=True,
+                protocol=mqtt.MQTTv311,
+                transport="websockets"
+            )
+        except (AttributeError, TypeError):
+            client = mqtt.Client(
+                client_id=client_id,
+                clean_session=True,
+                protocol=mqtt.MQTTv311,
+                transport="websockets"
+            )
+
+        client.username_pw_set(username=user_id, password=self._token)
+        client.tls_set_context(self.ssl_context)
+        client.ws_set_options(path="/mqtt")
+        client.reconnect_delay_set(min_delay=1, max_delay=30)
+        return client
+
+    @staticmethod
+    def _close_client(client) -> None:
+        """安静地释放一个 MQTT 客户端，任何异常都不向外抛"""
+        if client is None:
+            return
+        try:
+            client.loop_stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _handle_property_post(self, topic: str, payload: dict) -> None:
+        """处理设备属性上报"""
+        parts = topic.split('/')
+        if len(parts) < 4:
+            return
+        device_id = parts[3]
+
+        params = payload.get('params')
+        if not isinstance(params, dict):
+            return
+
+        attributes = {}
+        for key, value in params.items():
+            # 正常情况下是 {"value": x, "time": ...}，也兼容直接给标量
+            if isinstance(value, dict) and 'value' in value:
+                attributes[key] = value['value']
+            else:
+                attributes[key] = value
+
+        if attributes:
+            fire_event(self._hass, EVENT_DEVICE_DATA_CHANGED, {
+                'deviceId': device_id,
+                'attributes': attributes
+            })
+
+    def _handle_set_reply(self, topic: str, payload: dict) -> None:
+        """处理控制命令回执，确认下发的命令是否被设备接受"""
+        parts = topic.split('/')
+        device_id = parts[3] if len(parts) >= 4 else None
+
+        code = payload.get('code', payload.get('status'))
+        ok = str(code).strip().lower() in ('0', '200', 'success', 'ok')
+
+        if ok:
+            _LOGGER.debug('设备 %s 控制回执成功: %s', device_id, payload)
+        else:
+            _LOGGER.warning('设备 %s 控制回执失败: %s', device_id, payload)
 
         try:
-            # 连接MQTT服务器
-            _LOGGER.info("正在连接到MQTT服务器...")
-            client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
+            store = self._hass.data.setdefault(DOMAIN, {})
+            store['last_set_reply'] = {
+                'deviceId': device_id,
+                'code': code,
+                'ok': ok,
+                'payload': payload,
+                'time': time.time(),
+            }
+            if ok and device_id:
+                # 一条成功回执 = 设备刚被真实触达过(HA、小程序或别的客户端发的都算)。
+                # 锚点取 msgId 里的"指令发出时刻"而非"回执到达时刻"：
+                # 1) 保活自己那条指令的时刻不晚于本轮发送时刻，不会把下一轮
+                #    顺延零点几秒，间隔仍严格等于 interval；
+                # 2) 设备深睡时回执可能晚到几十秒，也不会把间隔拖过 interval。
+                # 解析不出 msgId 就不更新锚点，保活退回固定 interval，安全。
+                sent_wall = _parse_msgid_time(payload.get('msgId'))
+                if sent_wall is not None:
+                    sent_mono = time.monotonic() - max(time.time() - sent_wall, 0.0)
+                    store.setdefault(KEEPALIVE_ACTIVITY_KEY, {})[device_id] = sent_mono
+        except Exception:  # noqa: BLE001
+            pass
 
-            # 开始网络循环
-            client.loop_start()
-
-            # 保持程序运行，直到收到停止信号
-            while not signal.is_set():
-                await asyncio.sleep(1)
-
-        except Exception as e:
-            _LOGGER.exception(f"MQTT连接发生错误: {e}")
-        finally:
-            # 清理资源
-            client.loop_stop()
-            client.disconnect()
-            if process_id == self._hass.data['current_listen_devices_process_id']:
-                fire_event(self._hass, EVENT_GATEWAY_STATUS_CHANGED, {
-                    'status': False
+        # 回执里若带回了设备属性，一并同步，省掉一次快照请求
+        data = payload.get('data')
+        if isinstance(data, dict) and data and device_id:
+            attributes = {
+                key: (value['value'] if isinstance(value, dict) and 'value' in value else value)
+                for key, value in data.items()
+            }
+            if attributes:
+                fire_event(self._hass, EVENT_DEVICE_DATA_CHANGED, {
+                    'deviceId': device_id,
+                    'attributes': attributes
                 })
-            else:
-                _LOGGER.debug('process_id not match, skip...')
 
-            _LOGGER.info('listen device stopped.')
+    def _handle_push_notice(self, topic: str, payload: dict, known_keys: dict) -> None:
+        """
+        处理通知类消息。
+
+        实际结构（抓包确认）是：
+            {"type": "bugReport", "notice": {"message": "{\\"bugInfoList\\":[]}"}}
+        早先假设的 params.value 结构并不存在，这里两种都兼容。
+        """
+        notice_type = payload.get('type')
+        body = payload.get('notice')
+
+        data = None
+        if isinstance(body, dict):
+            message = body.get('message')
+            if isinstance(message, str):
+                try:
+                    data = json.loads(message)
+                except ValueError:
+                    data = None
+            if data is None and body:
+                data = body
+        if data is None:
+            legacy = (payload.get('params') or {}).get('value')
+            if isinstance(legacy, dict):
+                data = legacy
+
+        if not isinstance(data, dict) or not data:
+            _LOGGER.debug('推送通知(%s)无结构化内容: %s', notice_type, payload)
+            return
+
+        parts = topic.split('/')
+        # 账号级主题是 /sys/{userId}/thing/event/pushnotice，设备 id 只能从内容里取；
+        # 设备级主题是 /sys/{productKey}/{deviceId}/thing/event/pushnotice
+        device_id = data.get('deviceId')
+        if not device_id and isinstance(body, dict):
+            # 实测账号级通知里 deviceId 在外层 notice 上，内层 message 里没有
+            device_id = body.get('deviceId')
+        if not device_id and len(parts) >= 8:
+            device_id = parts[3]
+
+        status = data.get('status', data.get('online'))
+        if status is None and isinstance(body, dict):
+            status = body.get('status', body.get('online'))
+        if status is not None and device_id:
+            _LOGGER.info('设备 %s 在线状态变更: %s', device_id, status)
+
+        if not device_id:
+            _LOGGER.debug('推送通知(%s)无法定位设备，跳过: %s', notice_type, data)
+            return
+
+        keys = known_keys.get(device_id) or set()
+        attributes = {
+            key: value for key, value in data.items()
+            if key in keys and key not in ('status', 'deviceId')
+        }
+        if attributes:
+            fire_event(self._hass, EVENT_DEVICE_DATA_CHANGED, {
+                'deviceId': device_id,
+                'attributes': attributes
+            })
 
     @staticmethod
     async def send_command(session, token, deviceId: str, attributes: dict):
@@ -492,8 +974,17 @@ class TclClient:
         }
         async with session.post(url=api_url, headers=api_headers, json=api_body) as response:
             content = await response.json(content_type=None)
-            if 'traceId' in content and content['code'] != '200':
-                raise TclClientException('接口返回异常: ' + content['message'])
+            if not isinstance(content, dict):
+                _LOGGER.warning('Device %s control response is not a json object: %s', deviceId, content)
+                return
+
+            # 注意：code 可能是 int 200，也可能是字符串 '200'，统一转成字符串比较
+            code = str(content.get('code', '')).strip()
+            if 'traceId' in content and code not in ('200', '0'):
+                raise TclClientException(
+                    '接口返回异常: {}'.format(content.get('message') or content)
+                )
+            _LOGGER.debug('Device %s control %s -> %s', deviceId, attributes, content.get('message'))
 
     # ============================================================
     # 登录方法 (iOS App 凭据 + RSA 加密)

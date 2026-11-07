@@ -9,7 +9,8 @@ from homeassistant.helpers.config_validation import multi_select
 
 from .const import DOMAIN, FILTER_TYPE_EXCLUDE, FILTER_TYPE_INCLUDE
 from .const import LOGIN_METHOD_TOKEN, LOGIN_METHOD_PASSWORD, LOGIN_METHOD_SMS
-from .core.client import TclClientException, TclClient
+from .const import CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+from .core.client import TclClientException, TclClient, account_id_from_refresh_token
 from .core.config import AccountConfig, DeviceFilterConfig, EntityFilterConfig
 
 _LOGGER = logging.getLogger(__name__)
@@ -30,7 +31,8 @@ async def _do_token_login(hass, account_id, refresh_token):
     client2 = TclClient(hass, account_id, token_info.token)
     await client2.initialize()
     user_info = await client2.get_user_info()
-    return account_id, token_info.token, token_info.refresh_token, user_info['mobile']
+    return (account_id, token_info.token, token_info.refresh_token,
+            user_info['mobile'], token_info.expires_at)
 
 
 async def _do_password_login(hass, phone, password):
@@ -64,9 +66,9 @@ async def _do_sms_login(hass, phone, code):
 
 def _login_method_selector(default=LOGIN_METHOD_TOKEN):
     return vol.In({
-        LOGIN_METHOD_TOKEN: 'Token 登录',
-        LOGIN_METHOD_PASSWORD: '密码登录',
-        LOGIN_METHOD_SMS: '短信验证码登录',
+        LOGIN_METHOD_TOKEN: 'Token 登录（推荐：不会挤掉 TCL App）',
+        LOGIN_METHOD_PASSWORD: '密码登录（iOS 通道：会让 App 掉线）',
+        LOGIN_METHOD_SMS: '短信验证码登录（iOS 通道：会让 App 掉线）',
     })
 
 
@@ -91,31 +93,45 @@ class TclConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_token(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Token 登录"""
+        """Token 登录
+
+        推荐入口：从 TCL 小程序抓一次 refreshToken 粘进来即可。
+        这条路径走的是小程序通道的会话，不会让手机上的 TCL App 掉线；
+        之后 accessToken 每 30 天自动续期，refreshToken 60 天一轮换，长期不用再登录。
+        """
         errors: Dict[str, str] = {}
         if user_input is not None:
-            try:
-                account_id, token, refresh_token, mobile = await _do_token_login(
-                    self.hass, user_input[ACCOUNT_ID], user_input[REFRESH_TOKEN]
-                )
-                return self.async_create_entry(
-                    title="Tcl - {}".format(mobile),
-                    data={'account': {
-                        'login_method': LOGIN_METHOD_TOKEN,
-                        'phone': '',
-                        'account_id': account_id,
-                        'token': token,
-                        'refresh_token': refresh_token,
-                        'default_load_all_entity': user_input['default_load_all_entity']
-                    }}
-                )
-            except TclClientException as e:
-                _LOGGER.warning(str(e))
-                errors['base'] = 'auth_error'
+            refresh_token = (user_input.get(REFRESH_TOKEN) or '').strip()
+            account_id = (user_input.get(ACCOUNT_ID) or '').strip()
+            if not account_id:
+                # 允许只粘贴 refreshToken，账号 id 直接从 JWT 载荷里解析
+                account_id = account_id_from_refresh_token(refresh_token)
+            if not account_id:
+                errors['base'] = 'account_id_required'
+            else:
+                try:
+                    account_id, token, refresh_token, mobile, expires_at = await _do_token_login(
+                        self.hass, account_id, refresh_token
+                    )
+                    return self.async_create_entry(
+                        title="Tcl - {}".format(mobile),
+                        data={'account': {
+                            'login_method': LOGIN_METHOD_TOKEN,
+                            'phone': '',
+                            'account_id': account_id,
+                            'token': token,
+                            'refresh_token': refresh_token,
+                            'expires_at': expires_at,
+                            'default_load_all_entity': user_input['default_load_all_entity']
+                        }}
+                    )
+                except TclClientException as e:
+                    _LOGGER.warning(str(e))
+                    errors['base'] = 'auth_error'
         return self.async_show_form(
             step_id="token",
             data_schema=vol.Schema({
-                vol.Required(ACCOUNT_ID): str,
+                vol.Optional(ACCOUNT_ID, default=''): str,
                 vol.Required(REFRESH_TOKEN): str,
                 vol.Required('default_load_all_entity', default=True): bool,
             }),
@@ -208,19 +224,39 @@ class TclConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> config_entries.OptionsFlow:
-        return OptionsFlowHandler(config_entry)
+        # HA 2024.11 起 OptionsFlow.config_entry 由框架注入且只读，
+        # 不能再自己 __init__(config_entry) 赋值，否则打开"配置"会抛
+        # AttributeError: property 'config_entry' has no setter
+        return OptionsFlowHandler()
 
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self.config_entry = config_entry
+    def __init__(self) -> None:
         self._sms_phone = None
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """功能菜单"""
         return self.async_show_menu(
             step_id="init",
-            menu_options=['account', 'device', 'entity_device_selector']
+            menu_options=['account', 'device', 'entity_device_selector', 'polling']
+        )
+
+    async def async_step_polling(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """状态轮询设置"""
+        if user_input is not None:
+            options = dict(self.config_entry.options)
+            options[CONF_SCAN_INTERVAL] = int(user_input[CONF_SCAN_INTERVAL])
+            # 更新 options 会触发配置项更新监听器，集成会自动重载
+            self.hass.config_entries.async_update_entry(self.config_entry, options=options)
+            return self.async_create_entry(title='', data=options)
+
+        current = self.config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+        return self.async_show_form(
+            step_id="polling",
+            data_schema=vol.Schema({
+                vol.Required(CONF_SCAN_INTERVAL, default=current):
+                    vol.All(vol.Coerce(int), vol.Range(min=0, max=3600))
+            })
         )
 
     # ============================================================

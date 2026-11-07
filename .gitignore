@@ -1,6 +1,9 @@
-custom_components/tcl/__pycache__/*
-custom_components/tcl/core/__pycache__/*
+__pycache__/
+*.pyc
 custom_components/tcl/session
+
+# 本地开发工具数据
+.workbuddy/
 
 # 逆向分析相关 (不提交)
 tcl逆向/
