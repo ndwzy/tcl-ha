@@ -21,6 +21,9 @@ from .const import (
     CONF_KEEPALIVE_INTERVAL,
     DEFAULT_KEEPALIVE_INTERVAL,
     MIN_KEEPALIVE_INTERVAL,
+    KEEPALIVE_JITTER_RATIO,
+    KEEPALIVE_DEVICE_SPREAD_MIN,
+    KEEPALIVE_DEVICE_SPREAD_MAX,
     KEEPALIVE_ATTRIBUTE,
     KEEPALIVE_TIMEOUT,
     KEEPALIVE_SLOW_THRESHOLD,
@@ -154,12 +157,14 @@ def _get_scan_interval(entry: ConfigEntry) -> int:
     return max(interval, MIN_SCAN_INTERVAL)
 
 
-async def _interruptible_sleep(signal: threading.Event, seconds: int) -> bool:
-    """可被卸载信号打断的等待，返回 True 表示收到停止信号"""
-    for _ in range(max(int(seconds), 1)):
-        if signal.is_set():
-            return True
-        await asyncio.sleep(1)
+async def _interruptible_sleep(signal: threading.Event, seconds: float) -> bool:
+    """可被卸载信号打断的等待(支持小数秒)，返回 True 表示收到停止信号"""
+    deadline = time.monotonic() + max(seconds, 0)
+    while not signal.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(remaining, 1.0))
     return signal.is_set()
 
 
@@ -232,6 +237,21 @@ def _get_keepalive_interval(entry: ConfigEntry) -> int:
     return max(interval, MIN_KEEPALIVE_INTERVAL)
 
 
+def _keepalive_delay(interval: int) -> float:
+    """
+    生成本轮保活等待时长(秒)，每轮重抽一次。
+
+    区间 [interval * (1 - RATIO), interval]，刻意只做"负向抖动"：
+    保活间隔的上限决定设备会不会睡，实测 120s 稳定、240s 会出现 60s 延迟，
+    所以间隔绝不能随机到基准值以上。快照轮询兜底、慢一点无害，可以往后抖
+    (POLL_JITTER_MAX)；保活不行，两者抖动方向必须相反。
+
+    代价是均值低于基准(默认 105s)，请求量约 +14%；换来的是周期特征消失，
+    且安全边界完全不变(最大间隔仍恒等于 interval)。
+    """
+    return interval * random.uniform(1.0 - KEEPALIVE_JITTER_RATIO, 1.0)
+
+
 async def keepalive_updater(hass: HomeAssistant, entry: ConfigEntry,
                             targetDevices: List[TclDevice], signal: threading.Event):
     """
@@ -251,18 +271,27 @@ async def keepalive_updater(hass: HomeAssistant, entry: ConfigEntry,
         return
 
     _LOGGER.info(
-        'device keepalive enabled, every %ss for %d device(s)',
+        'device keepalive enabled, base=%ss jitter=%.0f~%ss for %d device(s)',
+        interval, interval * (1.0 - KEEPALIVE_JITTER_RATIO),
         interval, len(targetDevices)
     )
 
     while not signal.is_set():
-        # 集成刚加载完先等一个间隔再发，避免启动瞬间就去打云端接口
-        if await _interruptible_sleep(signal, interval):
+        # 集成刚加载完先等一个间隔再发，避免启动瞬间就去打云端接口；
+        # 每轮重抽间隔，避免以固定节奏访问云端
+        delay = _keepalive_delay(interval)
+        _LOGGER.debug('keepalive next round in %.1fs', delay)
+        if await _interruptible_sleep(signal, delay):
             break
 
-        for device in targetDevices:
+        for index, device in enumerate(targetDevices):
             if signal.is_set():
                 break
+            if index:
+                # 多设备时错开一点，别让 N 条请求挤在同一瞬间
+                if await _interruptible_sleep(signal, random.uniform(
+                        KEEPALIVE_DEVICE_SPREAD_MIN, KEEPALIVE_DEVICE_SPREAD_MAX)):
+                    break
 
             snapshot = device.attribute_snapshot_data or {}
             if KEEPALIVE_ATTRIBUTE not in snapshot:

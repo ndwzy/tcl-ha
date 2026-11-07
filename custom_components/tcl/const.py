@@ -46,6 +46,15 @@ OPTIMISTIC_PENDING_WINDOW = 90
 CONF_KEEPALIVE_INTERVAL = 'keepalive_interval'
 DEFAULT_KEEPALIVE_INTERVAL = 120
 MIN_KEEPALIVE_INTERVAL = 60
+# 保活抖动：每轮重抽一次，实际间隔 = interval * [1 - RATIO, 1.0]。
+# 只往前提、绝不往后拖——间隔的上限决定设备会不会进入深睡，实测 120s 稳定、
+# 240s 会出现 60s 延迟，所以必须封顶在基准值上。快照轮询可以往后抖
+# (POLL_JITTER_MAX)，保活不行，两者的抖动方向必须相反。
+# 默认 0.25 → 90~120s，均值 105s，请求量约 +14%(720 → 822 条/天)。
+KEEPALIVE_JITTER_RATIO = 0.25
+# 同一轮内多台设备之间的错峰(秒)，避免 N 台设备挤在同一瞬间请求云端
+KEEPALIVE_DEVICE_SPREAD_MIN = 0.2
+KEEPALIVE_DEVICE_SPREAD_MAX = 1.5
 # 保活用的属性：必须能触达设备，且与当前值相同，不改变任何状态
 KEEPALIVE_ATTRIBUTE = 'powerSwitch'
 # 单次保活请求超时(秒)：超时说明设备已经睡死，本轮放弃，等下一轮
