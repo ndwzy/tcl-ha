@@ -62,8 +62,7 @@
                     "account": "Update account",
                     "device": "Device Filter",
                     "entity_device_selector": "Entity Filter",
-                    "polling": "State polling",
-                    "keepalive": "Device keepalive"
+                    "polling": "State polling"
                 }
             },
             "account": {
@@ -130,18 +129,6 @@
                 "description": "State changes arrive in real time over MQTT; polling is only a fallback used when nothing has been pushed for a long time. The actual interval gets a random jitter (up to 1.6x) and is reset by every incoming MQTT message, so an active device rarely triggers a request. Default 300 seconds, 0 disables polling.",
                 "data": {
                     "scan_interval": "Base polling interval (seconds)"
-                }
-            },
-            "keepalive": {
-                "title": "Device keepalive settings",
-                "description": "When enabled, the integration periodically sends a no-op command (same value as the current power state) so the WiFi module stays in light sleep and real user actions get an instant reply. Disable it to stop all background commands, e.g. for manual sleep testing. The interval is anchored to each device's last successful control reply and defaults to 120 seconds (minimum 90). Changes take effect immediately.",
-                "data": {
-                    "keepalive_enabled": "Enable device keepalive",
-                    "keepalive_interval": "Keepalive interval (seconds)"
-                },
-                "data_description": {
-                    "keepalive_enabled": "Turn off to stop sending any background command to the device",
-                    "keepalive_interval": "90-3600 seconds, default 120. A user command resets the timer for that device."
                 }
             }
         }
