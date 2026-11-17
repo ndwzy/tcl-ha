@@ -2,25 +2,33 @@
     "config": {
         "error": {
             "auth_error": "认证失败",
-            "sms_error": "短信发送失败"
+            "sms_error": "短信发送失败",
+            "account_id_required": "无法从 refreshToken 解析 Account Id，请手工填写"
         },
         "step": {
             "user": {
                 "title": "选择登录方式",
+                "description": "推荐用「Token 登录」：粘贴 TCL 小程序的 refreshToken，插件就不会再走 iOS 登录，手机上的 TCL App 也不会被挤下线。",
                 "data": {
                     "login_method": "登录方式"
                 }
             },
             "token": {
-                "title": "Token 登录",
+                "title": "Token 登录（推荐）",
+                "description": "粘贴 TCL 小程序登录响应里的 refreshToken（eyJ 开头的三段式字符串）。Account Id 可留空，插件会自动解析。之后 accessToken 每 30 天自动续期，refreshToken 60 天一轮换，无需再次登录。",
                 "data": {
-                    "account_id": "Account Id",
+                    "account_id": "Account Id（可留空）",
                     "refresh_token": "Refresh Token",
                     "default_load_all_entity": "默认加载所有实体"
+                },
+                "data_description": {
+                    "account_id": "留空则从 refreshToken 的 JWT 载荷里自动解析",
+                    "refresh_token": "抓包小程序 /auth/thirdParty/bindUserByAuthCode 响应里的 refreshToken 字段"
                 }
             },
             "password": {
                 "title": "密码登录",
+                "description": "注意：这是 iOS App 通道，登录成功后手机上的 TCL App 会被挤下线。除非 Token 登录不可用，不建议使用。",
                 "data": {
                     "phone": "手机号",
                     "password": "密码",
@@ -29,7 +37,7 @@
             },
             "sms_phone": {
                 "title": "短信验证码登录",
-                "description": "输入手机号发送验证码",
+                "description": "注意：这是 iOS App 通道，验证码登录会让手机上的 TCL App 掉线。",
                 "data": {
                     "phone": "手机号",
                     "default_load_all_entity": "默认加载所有实体"
@@ -53,7 +61,8 @@
                 "menu_options": {
                     "account": "更新账户",
                     "device": "设备筛选",
-                    "entity_device_selector": "实体筛选"
+                    "entity_device_selector": "实体筛选",
+                    "polling": "状态轮询"
                 }
             },
             "account": {
@@ -113,6 +122,13 @@
                     "device_id": "目标设备（请勿修改）",
                     "filter_type": "筛选方式",
                     "target_entities": "实体列表"
+                }
+            },
+            "polling": {
+                "title": "状态轮询设置",
+                "description": "设备状态变化由 MQTT 实时推送，轮询只作为兜底：只有长时间没有收到任何推送时才会向云端拉取快照。实际间隔会在基准值上叠加随机抖动（最晚约 1.6 倍），且每收到一条 MQTT 消息都会重新计时，因此设备活跃时几乎不会真正发起请求。默认 300 秒，0 表示关闭轮询。",
+                "data": {
+                    "scan_interval": "基准轮询间隔(秒)"
                 }
             }
         }

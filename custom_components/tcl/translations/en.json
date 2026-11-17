@@ -2,43 +2,51 @@
     "config": {
         "error": {
             "auth_error": "Authentication failed",
-            "sms_error": "SMS sending failed"
+            "sms_error": "SMS sending failed",
+            "account_id_required": "Cannot parse Account Id from the refreshToken, please fill it in"
         },
         "step": {
             "user": {
-                "title": "Select Login Method",
+                "title": "Choose login method",
+                "description": "Token login is recommended: paste a refreshToken captured from the TCL mini program. The integration will not perform an iOS login, so the TCL App on your phone stays signed in.",
                 "data": {
-                    "login_method": "Login Method"
+                    "login_method": "Login method"
                 }
             },
             "token": {
-                "title": "Token Login",
+                "title": "Token login (recommended)",
+                "description": "Paste the refreshToken from the TCL mini program login response. Account Id can be left empty - it is parsed from the token. The access token auto-renews every 30 days, no further login needed.",
                 "data": {
-                    "account_id": "Account Id",
+                    "account_id": "Account Id (optional)",
                     "refresh_token": "Refresh Token",
-                    "default_load_all_entity": "Default load all entity"
+                    "default_load_all_entity": "Load all entities by default"
+                },
+                "data_description": {
+                    "account_id": "Leave empty to parse it from the refreshToken payload",
+                    "refresh_token": "The refreshToken field in the /auth/thirdParty/bindUserByAuthCode response"
                 }
             },
             "password": {
-                "title": "Password Login",
+                "title": "Password login",
+                "description": "Warning: this uses the iOS App channel and will sign the TCL App out on your phone.",
                 "data": {
-                    "phone": "Phone Number",
+                    "phone": "Phone number",
                     "password": "Password",
-                    "default_load_all_entity": "Default load all entity"
+                    "default_load_all_entity": "Load all entities by default"
                 }
             },
             "sms_phone": {
-                "title": "SMS Login",
-                "description": "Enter your phone number to receive a verification code",
+                "title": "SMS code login",
+                "description": "Warning: this uses the iOS App channel and will sign the TCL App out on your phone.",
                 "data": {
-                    "phone": "Phone Number",
-                    "default_load_all_entity": "Default load all entity"
+                    "phone": "Phone number",
+                    "default_load_all_entity": "Load all entities by default"
                 }
             },
             "sms_code": {
-                "title": "Enter Verification Code",
+                "title": "Enter the code",
                 "data": {
-                    "code": "Verification Code"
+                    "code": "Code"
                 }
             }
         }
@@ -53,7 +61,8 @@
                 "menu_options": {
                     "account": "Update account",
                     "device": "Device Filter",
-                    "entity_device_selector": "Entity Filter"
+                    "entity_device_selector": "Entity Filter",
+                    "polling": "State polling"
                 }
             },
             "account": {
@@ -113,6 +122,13 @@
                     "device_id": "Target device (do not modify)",
                     "filter_type": "Filter method",
                     "target_entities": "Entities"
+                }
+            },
+            "polling": {
+                "title": "State polling settings",
+                "description": "State changes arrive in real time over MQTT; polling is only a fallback used when nothing has been pushed for a long time. The actual interval gets a random jitter (up to 1.6x) and is reset by every incoming MQTT message, so an active device rarely triggers a request. Default 300 seconds, 0 disables polling.",
+                "data": {
+                    "scan_interval": "Base polling interval (seconds)"
                 }
             }
         }

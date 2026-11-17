@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from typing import Any
 
@@ -18,6 +17,7 @@ from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature, Platform
 from homeassistant.core import HomeAssistant
 
 from ..core.attribute import TclAttribute
+from ..core.config import DeviceFilterConfig
 from ..core.device import TclDevice
 from ..entity import TclAbstractEntity
 
@@ -53,6 +53,36 @@ FAN_SPEED_MAP = {
 # 反向映射，用于从设备返回的百分比查找对应的模式名称
 REVERSE_FAN_SPEED_MAP = {v: k for k, v in FAN_SPEED_MAP.items()}
 
+# 设备/云端可能用字符串表示"关"的状态
+POWER_OFF_VALUES = {"off", "0", "false", "close", "关机", ""}
+
+
+def is_power_on(value: Any) -> bool:
+    """把云端/MQTT 返回的开关值统一解析为 bool"""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() not in POWER_OFF_VALUES
+    return bool(value)
+
+
+def to_number(value: Any):
+    """把可能是字符串的数值转成 float，失败返回 None"""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities) -> None:
     """设置 TCL 空调实体"""
@@ -61,19 +91,23 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
 
     entities = []
     for device in devices:
-        # 检查设备是否包含空调相关的属性，以此判断是否为空调设备
-        # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-        has_climate_attrs = any(
-            attr.key in ("powerSwitch", "workMode", "targetTemperature", "windSpeedPercentage") for attr in
-            device.attributes)
-        if has_climate_attrs:
-            # 为该空调设备创建一个"虚拟"的 TclAttribute，用于兼容 TclAbstractEntity 的构造函数
-            climate_attr = TclAttribute(
-                key="climate_control",  # 为气候实体定义一个通用 key
-                display_name=f"{device.name} 空调",  # 气候实体显示名称
-                platform=Platform.CLIMATE  # 指定平台为 Climate
-            )
-            entities.append(TclClimateEntity(device, climate_attr))
+        # 遵循配置里的设备筛选，被排除的设备不应再创建空调实体
+        if DeviceFilterConfig.is_skip(hass, config_entry, device.id):
+            continue
+
+        # 必须同时具备电源与模式属性才认为是空调设备
+        keys = {attr.key for attr in device.attributes}
+        if not {"powerSwitch", "workMode"}.issubset(keys):
+            _LOGGER.debug('Device %s is not an air conditioner, skip climate entity', device.id)
+            continue
+
+        # 为该空调设备创建一个"虚拟"的 TclAttribute，用于兼容 TclAbstractEntity 的构造函数
+        climate_attr = TclAttribute(
+            key="climate_control",  # 为气候实体定义一个通用 key
+            display_name=f"{device.name} 空调",  # 气候实体显示名称
+            platform=Platform.CLIMATE  # 指定平台为 Climate
+        )
+        entities.append(TclClimateEntity(device, climate_attr))
 
     async_add_entities(entities)
 
@@ -92,6 +126,7 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
         # 移除 ClimateEntityFeature.HVAC_MODE，因为您的 HomeAssistant 版本可能不支持此属性
     )
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_target_temperature_step = 0.5
     # 更新风扇模式列表为我们定义的中文名称
     _attr_fan_modes = list(FAN_SPEED_MAP.keys())
     _attr_hvac_modes = [HVACMode.OFF] + list(MODE_MAP.values())
@@ -105,65 +140,73 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
         # 初始化记忆模式，默认给个自动，防止第一次无数据
         self._last_on_mode = HVACMode.AUTO
 
+    @property
+    def _snapshot(self) -> dict:
+        return self._device.attribute_snapshot_data
+
     def _update_value(self) -> None:
         """从设备属性数据中更新实体状态。"""
+        snapshot = self._snapshot
+
         # 检查电源开关状态
-        # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-        power = self._device.attribute_snapshot_data.get("powerSwitch")
+        power = snapshot.get("powerSwitch")
         if power is None:
             # 如果 powerSwitch 不存在，可能设备离线或数据未完全加载
             self._attr_available = False
             return
-        else:
-            self._attr_available = True
+
+        self._attr_available = True
 
         # 设置 HVAC 模式
-        # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-        if power in ["off", False, 0]:
-            self._attr_hvac_mode = HVACMode.OFF
-        else:
-            mode = self._device.attribute_snapshot_data.get("workMode")
-            mode_key=REVERSE_STR_TO_CODE.get(mode,0)
+        if is_power_on(power):
+            mode = snapshot.get("workMode")
+            # 云端可能返回 int 1 或字符串 "1"，统一转成 int 再映射
+            if isinstance(mode, str):
+                try:
+                    mode = int(mode.strip())
+                except ValueError:
+                    pass
+            mode_key = REVERSE_STR_TO_CODE.get(mode, "auto")
             self._attr_hvac_mode = MODE_MAP.get(mode_key, HVACMode.AUTO)
             # 只要不是关机，就实时记录当前模式到记忆变量
             self._last_on_mode = self._attr_hvac_mode
+        else:
+            self._attr_hvac_mode = HVACMode.OFF
 
         # 设置 HVAC 动作
-        if self._attr_hvac_mode == HVACMode.HEAT:
-            self._attr_hvac_action = HVACAction.HEATING
-        elif self._attr_hvac_mode == HVACMode.COOL:
-            self._attr_hvac_action = HVACAction.COOLING
-        elif self._attr_hvac_mode == HVACMode.DRY:
-            self._attr_hvac_action = HVACAction.DRYING
-        elif self._attr_hvac_mode == HVACMode.FAN_ONLY:
-            self._attr_hvac_action = HVACAction.FAN
-        elif self._attr_hvac_mode == HVACMode.AUTO:
-            self._attr_hvac_action = HVACAction.IDLE  # 自动模式下设为空闲
-        else:
-            self._attr_hvac_action = HVACAction.IDLE
+        hvac_action_map = {
+            HVACMode.HEAT: HVACAction.HEATING,
+            HVACMode.COOL: HVACAction.COOLING,
+            HVACMode.DRY: HVACAction.DRYING,
+            HVACMode.FAN_ONLY: HVACAction.FAN,
+            HVACMode.AUTO: HVACAction.IDLE,
+            HVACMode.OFF: HVACAction.OFF,
+        }
+        self._attr_hvac_action = hvac_action_map.get(self._attr_hvac_mode, HVACAction.IDLE)
 
-        # 设置目标温度
-        # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-        self._attr_target_temperature = self._device.attribute_snapshot_data.get("targetTemperature") or 24  # 默认温度为24
+        # 设置目标温度(注意用 None 判断，不能用 or，否则 0 会被覆盖成默认值)
+        target_temperature = to_number(snapshot.get("targetTemperature"))
+        self._attr_target_temperature = target_temperature if target_temperature is not None else 24
+
         # 更新当前温度
-        self._attr_current_temperature = self._device.attribute_snapshot_data.get("currentTemperature") or None
-        # 设置风扇模式
-        # 从设备获取实际风速百分比
-        wind_speed_percentage = self._device.attribute_snapshot_data.get("windSpeedPercentage")
-        # 查找最接近的自定义模式名称
+        self._attr_current_temperature = to_number(snapshot.get("currentTemperature"))
+
+        # 设置风扇模式：从设备获取实际风速百分比，取最接近的预设档位
+        wind_speed_percentage = to_number(snapshot.get("windSpeedPercentage"))
         if wind_speed_percentage is not None:
-            # 找到最接近的预设风速
             closest_speed = min(FAN_SPEED_MAP.values(), key=lambda x: abs(x - wind_speed_percentage))
             self._attr_fan_mode = REVERSE_FAN_SPEED_MAP.get(closest_speed, "自动")  # 默认"自动"
         else:
             self._attr_fan_mode = "自动"  # 如果数据缺失，默认"自动"
 
         # 更新摆动模式
-        if self._device.attribute_snapshot_data.get("verticalWind") == 1 and self._device.attribute_snapshot_data.get("horizontalWind") == 1:
+        vertical_wind = is_power_on(snapshot.get("verticalWind"))
+        horizontal_wind = is_power_on(snapshot.get("horizontalWind"))
+        if vertical_wind and horizontal_wind:
             self._attr_swing_mode = SWING_BOTH
-        elif self._device.attribute_snapshot_data.get("verticalWind") == 1:
+        elif vertical_wind:
             self._attr_swing_mode = SWING_VERTICAL
-        elif self._device.attribute_snapshot_data.get("horizontalWind") == 1:
+        elif horizontal_wind:
             self._attr_swing_mode = SWING_HORIZONTAL
         else:
             self._attr_swing_mode = SWING_OFF
@@ -171,39 +214,43 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """设置 HVAC 模式。"""
         if hvac_mode == HVACMode.OFF:
-            # 注意：这里将属性键改为驼峰命名法以匹配设备数据
+            # 乐观更新，先让 UI 立刻反映关机，再下发命令
+            self._attr_hvac_mode = HVACMode.OFF
+            self._attr_hvac_action = HVACAction.OFF
+            self._write_state()
             self._send_command({"powerSwitch": 0})
-        else:
-            # 如果当前是关闭状态，先打开电源
-            # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-            if self._device.attribute_snapshot_data.get("powerSwitch") in ["off", False, 0]:
-                self._send_command({"powerSwitch": 1})
-                await asyncio.sleep(0.5)  # 稍微延迟，确保电源状态已更新
-            # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-            modeKey=REVERSE_MODE_MAP.get(hvac_mode, "auto")
-            self._send_command({"workMode": STR_TO_CODE.get(modeKey, "auto")})
+            return
 
-    # Implement one of these methods.
-    # The `turn_on` method should set `hvac_mode` to any other than
-    # `HVACMode.OFF` by optimistically setting it from the service action
-    # handler or with the next state update
+        # 机身处于关闭状态时，把开机和模式放在同一条命令里下发。
+        # 分两次发送 + sleep 的写法存在竞态：设备刚上电可能还没收到第二条命令。
+        payload: dict = {}
+        if not is_power_on(self._snapshot.get("powerSwitch")):
+            payload["powerSwitch"] = 1
 
-    async def async_turn_on(self):
+        mode_key = REVERSE_MODE_MAP.get(hvac_mode, "auto")
+        payload["workMode"] = STR_TO_CODE.get(mode_key, 0)
+
+        self._attr_hvac_mode = hvac_mode
+        self._last_on_mode = hvac_mode
+        self._write_state()
+        self._send_command(payload)
+
+    async def async_turn_on(self) -> None:
         """Turn the entity on."""
         # 获取记忆模式
         target_mode = self._last_on_mode
 
-        # 安全防御：如果记忆模式是 OFF (极少见)，则强制转为自动或制热
+        # 安全防御：如果记忆模式是 OFF (极少见)，则强制转为自动
         if target_mode == HVACMode.OFF:
             target_mode = HVACMode.AUTO
 
         # 调用自身的设置模式方法 (注意要加 await 和 self)
         await self.async_set_hvac_mode(target_mode)
 
-    async def async_turn_off(self):
+    async def async_turn_off(self) -> None:
         """Turn the entity off."""
         # 关机前最后保存一次当前模式 (双重保险)
-        if self._attr_hvac_mode != HVACMode.OFF:
+        if self._attr_hvac_mode not in (HVACMode.OFF, None):
             self._last_on_mode = self._attr_hvac_mode
 
         # 设置为 OFF
@@ -213,18 +260,23 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
         """设置风扇模式。"""
         # 将自定义模式名称转换为对应的风速百分比
         target_speed = FAN_SPEED_MAP.get(fan_mode)
-        if target_speed is not None:
-            # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-            self._send_command({"windSpeedPercentage": target_speed})
-        else:
-            _LOGGER.warning(f"无法识别的风扇模式: {fan_mode}")
+        if target_speed is None:
+            _LOGGER.warning("无法识别的风扇模式: %s", fan_mode)
+            return
+
+        self._attr_fan_mode = fan_mode
+        self._write_state()
+        self._send_command({"windSpeedPercentage": target_speed})
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """设置目标温度。"""
         temp = kwargs.get(ATTR_TEMPERATURE)
-        if temp is not None:
-            # 注意：这里将属性键改为驼峰命名法以匹配设备数据
-            self._send_command({"targetTemperature": temp})
+        if temp is None:
+            return
+
+        self._attr_target_temperature = temp
+        self._write_state()
+        self._send_command({"targetTemperature": temp})
 
     @property
     def swing_modes(self):
@@ -234,10 +286,17 @@ class TclClimateEntity(TclAbstractEntity, ClimateEntity):
     async def async_set_swing_mode(self, swing_mode: str) -> None:
         """设置摆动"""
         if swing_mode == SWING_OFF:
-            self._send_command({"verticalWind": 0, "horizontalWind": 0})
+            payload = {"verticalWind": 0, "horizontalWind": 0}
         elif swing_mode == SWING_BOTH:
-            self._send_command({"verticalWind": 1, 'verticalDirection': 1, "horizontalWind": 1, 'horizontalDirection': 1})
+            payload = {"verticalWind": 1, 'verticalDirection': 1, "horizontalWind": 1, 'horizontalDirection': 1}
         elif swing_mode == SWING_VERTICAL:
-            self._send_command({"verticalWind": 1, 'verticalDirection': 1, "horizontalWind": 0})
+            payload = {"verticalWind": 1, 'verticalDirection': 1, "horizontalWind": 0}
         elif swing_mode == SWING_HORIZONTAL:
-            self._send_command({"verticalWind": 0, "horizontalWind": 1, 'horizontalDirection': 1})
+            payload = {"verticalWind": 0, "horizontalWind": 1, 'horizontalDirection': 1}
+        else:
+            _LOGGER.warning("无法识别的摆动模式: %s", swing_mode)
+            return
+
+        self._attr_swing_mode = swing_mode
+        self._write_state()
+        self._send_command(payload)
