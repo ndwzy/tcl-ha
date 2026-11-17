@@ -3,12 +3,13 @@ import base64
 import functools
 import json
 import logging
+import os
 import random
 import ssl
 import threading
 import time
 import uuid
-from typing import List, Optional
+from typing import List
 
 import aiohttp
 import paho.mqtt.client as mqtt
@@ -17,12 +18,13 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.util.ssl import client_context
 from .device import TclDevice
+from .control_retry import AbandonRegistry, new_msgid, send_with_retry
 from .event import EVENT_DEVICE_DATA_CHANGED, EVENT_GATEWAY_STATUS_CHANGED
 from .event import fire_event
+
 from ..ac.panel_config_fallback import get_fallback_attributes, merge_attributes
 from ..const import (
     DOMAIN,
-    KEEPALIVE_ACTIVITY_KEY,
     MQTT_KEEPALIVE,
     MQTT_RETRY_MIN,
     MQTT_RETRY_MAX,
@@ -31,21 +33,6 @@ from ..const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _parse_msgid_time(msg_id) -> Optional[float]:
-    """
-    从 miniprogram_<随机>_<毫秒戳> 中解析出指令发出时刻(wall clock 秒)。
-
-    解析不出来时返回 None，此时调用方应放弃顺延保活而不是猜一个时间。
-    """
-    if not isinstance(msg_id, str):
-        return None
-    tail = msg_id.rsplit('_', 1)[-1]
-    if not tail.isdigit():
-        return None
-    value = int(tail)
-    return value / 1000.0 if value > 1e11 else float(value)
 
 
 APP_ID = '55141607047147220'
@@ -218,6 +205,10 @@ class TclClient:
         self._user_id = None
         # 预创建 SSLContext 对象
         self.ssl_context = None  # 初始化为 None
+        # 已放弃的 msgId 登记表。云端事务被本地切断后，设备仍可能在 60s
+        # 硬超时后回执一次旧值，这些回执必须丢弃，否则会把补发后的真实
+        # 状态打回去。
+        self._abandon = AbandonRegistry(self.ABANDON_TTL)
 
     @property
     def getToken(self):
@@ -839,6 +830,14 @@ class TclClient:
         parts = topic.split('/')
         device_id = parts[3] if len(parts) >= 4 else None
 
+        # 被本地切断（超时补发）的旧事务，云端可能在 60s 硬超时后补发一次回执。
+        # 这类回执携带的是被放弃的 msgId，必须丢弃，否则会把补发后的
+        # 真实状态覆盖回旧值。
+        reply_msg_id = payload.get('msgId')
+        if isinstance(reply_msg_id, str) and self._is_abandoned(reply_msg_id):
+            _LOGGER.debug('设备 %s 回执来自已废弃 msgId=%s，已忽略', device_id, reply_msg_id)
+            return
+
         code = payload.get('code', payload.get('status'))
         ok = str(code).strip().lower() in ('0', '200', 'success', 'ok')
 
@@ -856,17 +855,6 @@ class TclClient:
                 'payload': payload,
                 'time': time.time(),
             }
-            if ok and device_id:
-                # 一条成功回执 = 设备刚被真实触达过(HA、小程序或别的客户端发的都算)。
-                # 锚点取 msgId 里的"指令发出时刻"而非"回执到达时刻"：
-                # 1) 保活自己那条指令的时刻不晚于本轮发送时刻，不会把下一轮
-                #    顺延零点几秒，间隔仍严格等于 interval；
-                # 2) 设备深睡时回执可能晚到几十秒，也不会把间隔拖过 interval。
-                # 解析不出 msgId 就不更新锚点，保活退回固定 interval，安全。
-                sent_wall = _parse_msgid_time(payload.get('msgId'))
-                if sent_wall is not None:
-                    sent_mono = time.monotonic() - max(time.time() - sent_wall, 0.0)
-                    store.setdefault(KEEPALIVE_ACTIVITY_KEY, {})[device_id] = sent_mono
         except Exception:  # noqa: BLE001
             pass
 
@@ -944,34 +932,26 @@ class TclClient:
                 'attributes': attributes
             })
 
+    # ============================================================
+    # 控制重发策略
+    # ============================================================
+    # 云端是"等设备确认"模型：设备醒着时 0.2s 返回；事务被挂起时，
+    # 云端要等 60s 硬超时才响应。实测（phase1，25/25）用新 msgId 补发
+    # 能让云端重新投递、设备在 0.1~0.2s 内执行，所以不必干等 60s。
+    CONTROL_RETRY_TIMEOUT = 3.0   # 单次 HTTP 等待上限（秒）
+    CONTROL_MAX_ATTEMPTS = 3      # 最多尝试次数
+    CONTROL_FINAL_TIMEOUT = 65.0  # 最后一次的硬上限（云端 60s 兜底 + 余量）
+    ABANDON_TTL = 75.0            # 废弃 msgId 的忽略窗口（秒）
+
+    def _abandon_msgid(self, msg_id: str) -> None:
+        self._abandon.abandon(msg_id)
+
+    def _is_abandoned(self, msg_id: str) -> bool:
+        return self._abandon.is_abandoned(msg_id)
+
     @staticmethod
-    async def send_command(session, token, deviceId: str, attributes: dict):
-        api_url = CONTROL_DEVICE_API.format(deviceId=deviceId)
-        api_headers = {
-            "Host": "io.zx.tcljd.com",
-            "accessToken": token,
-            "t-app-version": APP_VERSION,
-            "t-store-uuid": APP_UUID,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13)XWEB/13639",
-            "Content-Type": "application/json;charset=UTF-8",
-            "xweb_xhr": "1",
-            "miniGramSetup": "1",
-            "t-platform-type": APP_PLATFORM_TYPE,
-            "Referer": "https://servicewechat.com/wxed3f11c6ee178737/243/page-frame.html"
-        }
-        r = str(int(random.random() * 1e5))
-        i = str(int(time.time() * 1000))
-        params = []
-        for key, value in attributes.items():
-            attr = {}
-            attr[str(key)] = value
-            params.append(attr)
-        api_body = {
-            "msgId": f"miniprogram_{r}_{i}",
-            "source": "miniprogram",
-            "version": "3.0.0",
-            "params": params
-        }
+    async def _post_control(session, api_url, api_headers, api_body, deviceId: str):
+        """发一次控制请求并校验响应。"""
         async with session.post(url=api_url, headers=api_headers, json=api_body) as response:
             content = await response.json(content_type=None)
             if not isinstance(content, dict):
@@ -984,7 +964,80 @@ class TclClient:
                 raise TclClientException(
                     '接口返回异常: {}'.format(content.get('message') or content)
                 )
-            _LOGGER.debug('Device %s control %s -> %s', deviceId, attributes, content.get('message'))
+            _LOGGER.debug('Device %s control %s -> %s', deviceId, api_body.get('msgId'), content.get('message'))
+
+    @staticmethod
+    async def send_command(session, token, deviceId: str, attributes: dict):
+        """兼容旧调用方式的入口（无补发）。实例调用请用 async_control。"""
+        api_url = CONTROL_DEVICE_API.format(deviceId=deviceId)
+        api_headers = TclClient._build_control_headers(token)
+        params = []
+        for key, value in attributes.items():
+            attr = {}
+            attr[str(key)] = value
+            params.append(attr)
+        r = str(int(random.random() * 1e5))
+        i = str(int(time.time() * 1000))
+        api_body = {
+            "msgId": f"miniprogram_{r}_{i}",
+            "source": "miniprogram",
+            "version": "3.0.0",
+            "params": params
+        }
+        await TclClient._post_control(session, api_url, api_headers, api_body, deviceId)
+
+    @staticmethod
+    def _build_control_headers(token: str) -> dict:
+        return {
+            "Host": "io.zx.tcljd.com",
+            "accessToken": token,
+            "t-app-version": APP_VERSION,
+            "t-store-uuid": APP_UUID,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781(0x6700143B) NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF WindowsWechat(0x63090a13)XWEB/13639",
+            "Content-Type": "application/json;charset=UTF-8",
+            "xweb_xhr": "1",
+            "miniGramSetup": "1",
+            "t-platform-type": APP_PLATFORM_TYPE,
+            "Referer": "https://servicewechat.com/wxed3f11c6ee178737/243/page-frame.html"
+        }
+
+    async def async_control(self, deviceId: str, attributes: dict) -> str:
+        """带补发的控制下发。
+
+        第 1、2 次各等 CONTROL_RETRY_TIMEOUT 秒；超时即切断并把该 msgId
+        记入废弃表，随即用新 msgId 重发。第 3 次不再切断，让云端自然返回，
+        保证最终一定拿到结果（最坏 60s，与原先一致）。
+        """
+        api_url = CONTROL_DEVICE_API.format(deviceId=deviceId)
+        params = []
+        for key, value in attributes.items():
+            attr = {}
+            attr[str(key)] = value
+            params.append(attr)
+
+        async def _post(msg_id: str) -> None:
+            api_body = {
+                "msgId": msg_id,
+                "source": "miniprogram",
+                "version": "3.0.0",
+                "params": params,
+            }
+            headers = self._build_control_headers(self._token)
+            await self._post_control(self._session, api_url, headers, api_body, deviceId)
+
+        try:
+            return await send_with_retry(
+                _post,
+                self._abandon,
+                retry_timeout=self.CONTROL_RETRY_TIMEOUT,
+                max_attempts=self.CONTROL_MAX_ATTEMPTS,
+                final_timeout=self.CONTROL_FINAL_TIMEOUT,
+                describe='设备 %s 控制 %s' % (deviceId, attributes),
+            )
+        except asyncio.TimeoutError as err:
+            raise TclClientException(
+                '控制请求超时（已尝试 %d 次）' % self.CONTROL_MAX_ATTEMPTS
+            ) from err
 
     # ============================================================
     # 登录方法 (iOS App 凭据 + RSA 加密)

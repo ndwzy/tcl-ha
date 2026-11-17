@@ -10,11 +10,6 @@ from homeassistant.helpers.config_validation import multi_select
 from .const import DOMAIN, FILTER_TYPE_EXCLUDE, FILTER_TYPE_INCLUDE
 from .const import LOGIN_METHOD_TOKEN, LOGIN_METHOD_PASSWORD, LOGIN_METHOD_SMS
 from .const import CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
-from .const import (
-    CONF_KEEPALIVE_ENABLED, DEFAULT_KEEPALIVE_ENABLED,
-    CONF_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_INTERVAL,
-    MIN_KEEPALIVE_INTERVAL, MAX_KEEPALIVE_INTERVAL,
-)
 from .core.client import TclClientException, TclClient, account_id_from_refresh_token
 from .core.config import AccountConfig, DeviceFilterConfig, EntityFilterConfig
 
@@ -243,52 +238,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         """功能菜单"""
         return self.async_show_menu(
             step_id="init",
-            menu_options=['account', 'device', 'entity_device_selector', 'polling', 'keepalive']
-        )
-
-    @staticmethod
-    def _as_bool(value, fallback: bool) -> bool:
-        """兼容手工写入 options 的字符串值(如 'false')。"""
-        if value is None:
-            return fallback
-        if isinstance(value, str):
-            return value.strip().lower() not in ('false', '0', 'no', 'off', '')
-        return bool(value)
-
-    async def async_step_keepalive(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """设备保活：开关 + 间隔。
-
-        关闭后不再向设备下发任何后台指令，方便手动测试休眠行为。
-        修改 options 会触发 update listener，集成自动重载并立即生效。
-        """
-        if user_input is not None:
-            options = dict(self.config_entry.options)
-            options[CONF_KEEPALIVE_ENABLED] = bool(user_input[CONF_KEEPALIVE_ENABLED])
-            options[CONF_KEEPALIVE_INTERVAL] = int(user_input[CONF_KEEPALIVE_INTERVAL])
-            # 更新 options 会触发配置项更新监听器，集成会自动重载
-            self.hass.config_entries.async_update_entry(self.config_entry, options=options)
-            return self.async_create_entry(title='', data=options)
-
-        options = self.config_entry.options
-        current_enabled = self._as_bool(
-            options.get(CONF_KEEPALIVE_ENABLED), DEFAULT_KEEPALIVE_ENABLED
-        )
-        try:
-            current_interval = int(options.get(CONF_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_INTERVAL))
-        except (TypeError, ValueError):
-            current_interval = DEFAULT_KEEPALIVE_INTERVAL
-        # 旧配置可能低于新的下限，展示时先夹到合法区间，避免表单无法提交
-        current_interval = min(max(current_interval, MIN_KEEPALIVE_INTERVAL), MAX_KEEPALIVE_INTERVAL)
-
-        return self.async_show_form(
-            step_id="keepalive",
-            data_schema=vol.Schema({
-                vol.Required(CONF_KEEPALIVE_ENABLED, default=current_enabled): bool,
-                vol.Required(CONF_KEEPALIVE_INTERVAL, default=current_interval):
-                    vol.All(vol.Coerce(int), vol.Range(
-                        min=MIN_KEEPALIVE_INTERVAL, max=MAX_KEEPALIVE_INTERVAL
-                    )),
-            })
+            menu_options=['account', 'device', 'entity_device_selector', 'polling']
         )
 
     async def async_step_polling(self, user_input: dict[str, Any] | None = None) -> FlowResult:

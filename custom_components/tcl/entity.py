@@ -161,9 +161,9 @@ class TclAbstractEntity(Entity, ABC):
             self._write_state()
 
             try:
-                await self._client.send_command(
-                    self._client.getSession,
-                    self._client.getToken,
+                # async_control 内含补发：云端挂起超过 3s 就换新 msgId 重投，
+                # 避免干等 60s 硬超时。
+                await self._client.async_control(
                     e.data['deviceId'],
                     attributes
                 )
